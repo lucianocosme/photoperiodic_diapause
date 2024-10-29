@@ -1,0 +1,3760 @@
+---
+title: "GWAS Aedes albopictus diapause"
+author: "Luciano V Cosme"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    highlight: breezedark
+    css:
+      - "styles.css"
+    toc: yes
+    toc_float: no
+    toc_depth: 5
+editor_options:
+  markdown:
+    wrap: 120
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  eval                        = TRUE,
+  echo                        = TRUE,
+  cache                       = TRUE, # tidy = TRUE,
+  class.output                = "bg-success"
+)
+knitr::opts_knit$set(
+  root.dir = rprojroot::find_rstudio_root_file()
+)
+```
+
+
+# 1. Getting started: R libraries and software for QC
+
+## 1.1 R libraries and software
+
+```{r libraries, message=FALSE, results='hide'}
+library(tidyverse)
+library(here)
+library(dplyr)
+library(ggplot2)
+library(colorout)
+library(extrafont)
+library(reticulate)
+library(scales)
+library(stringr)
+library(grid)
+library(flextable)
+library(devtools)
+library(readr)
+library(purrr)
+library(ggtext)
+library(ggvenn)
+library(qqplotr)
+library(qqman)
+library(qqplotr)
+library(data.table)
+library(fuzzyjoin)
+library(openxlsx)
+library(RColorBrewer)
+```
+
+## 1.2 Check directory structure for the project
+
+**Note:** make sure you download the raw data and place it in a new directory. You can check the directory structure
+using a tool called [Tree](https://atom.io/packages/ascii-tree "Tool for directory structure.").
+
+```{bash tree, results='hide', eval=FALSE}
+# check all the Tree options with the command in our terminal: man tree
+tree -L 2 -d --charset=ascii . # -L set the directory depth to show; the flag -d tells tree to return directories only. and the period at the end tells tree to use the current directory; --charset=ascii is to show nicely here.
+# if you want to see the files you can use the code below.
+# tree --dirsfirst .
+```
+
+## 1.3 Download software for quality control
+
+I used PLINK v2.00a3.3 64-bit (3 Jun 2022) for all the analysis. However, the Affymetrix software does not export the
+files directly into a format we can import into Plink2. Therefore, we need first to use Plink 1.9 to convert the .ped
+and .map file format to .bed, .bin, and .fam. You can install it with conda. You can download
+[Miniconda](https://conda.io/projects/conda/en/latest/user-guide/install/download.html "To download miniconda") or
+[Anaconda](https://www.anaconda.com/ "To download Anaconda."). conda install -c bioconda plink2. If you have problems,
+you can also get it from [GitHub](https://github.com/chrchang/plink-ng "Download Plink2."), and compile it for our OS
+(both versions, 1.9 and 2). Please check [Marees et. al, 2018](https://doi.org/10.1002/mpr.1608 "Link to publication.")
+for more information about quality control using Plink 1.9. I used some of their code for quality control, and their
+general guidelines.
+
+Check our Plink2 version.
+```{bash plink2_version}
+plink2 --version
+```
+
+**First check if the data is in the correct location:**
+```{bash check_files, cache=TRUE}
+ls data/gwas/* # we use * to truncate the name of the file showing all files
+```
+
+Note about the bash multiline comments.<br> Since we will use the Plink command with one option per
+line separated by backslash `/` , and not one single line command, we add comments using `` # ` ``
+to open and `` ` `` to close.<br> For example, we can split the `plink2 –version` into a multiline
+command with a comment.
+```{bash commenting_bash_chunks}
+plink2 `# this still works` \
+--version
+```
+
+## 2. The data
+
+I prepared the data with the families and individual ids. I also set the reference alleles to match the AlbF3 genome assembly
+
+Check the fam file
+```{bash check_fam_file}
+# Check head of data
+bcftools query -l data/gwas/gwas_dp_july_23_2023.vcf | head
+bcftools query -l data/gwas/gwas_dp_july_23_2023.vcf | wc -l
+```
+
+### 2.1 Use Plink2 to convert to bed format
+```{bash plink2_convert_vcf_to_bed1}
+# If you run this chunk you will have to open the file.fam in a text editor and set parents id and sex of each individual. I fix it using bash tools. You can start on the next chunk if you do not want to have to repeat what I did.
+# we also check if the reference genome and the reference alleles match.
+plink2 \
+--allow-extra-chr \
+--vcf data/gwas/gwas_dp_july_23_2023.vcf \
+--const-fid \
+--make-bed \
+--exclude data/files/albopictus_SNPs_fail_segregation.txt \
+--fa data/genome/albo.fasta.gz \
+--ref-from-fa 'force' `# sets REF alleles when it can be done unambiguously, we use force to change the alleles` \
+--out output/gwas/file1 \
+--silent;
+# --keep-allele-order \ if you use Plink 1.9
+grep "variants" output/gwas/file1.log; # to get the number of variants from the log file.
+```
+
+
+Check the headings of the the files we will work on.
+```{bash check_headings1, cache=TRUE}
+head -n 5 output/gwas/file1.fam
+```
+
+Check how many samples are in the .fam file
+```{bash check_how_many_samples_fam}
+wc -l output/gwas/file1.fam
+```
+
+We need to update the family information, individual id, and sex of each individual. We can use the same file we use with the Axiom Suite to update our .fam file. 
+
+```{bash, cache=TRUE}
+head -n 5 data/gwas/gwas_fam.txt
+```
+
+```{bash nheck_how_many_samples_fam_file}
+# we use tail -n+2 to not show the heading and then we count how many lines we have. We have some samples that failed QC in the Axiom Suite software, but I have them in the fam file. It will not be a problems since we will only keep those that match.
+tail -n+2 data/gwas/gwas_fam.txt | wc -l
+```
+
+### 2.1.1 Use R to update the .fam file
+There are two options to update the sample information. We can use R or python to do it.
+
+Import the fam file we use with Axiom Suite
+```{r import_fam_file_Axiom, cache=TRUE}
+# the order of the rows in this file does not matter
+samples <-
+  read.delim(
+    file   = here(
+      "data", "gwas", "gwas_fam.txt"
+    ),
+    header = TRUE
+  )
+head(samples)
+```
+
+Import .fam file we created once we created the bed file using Plink2
+```{r import_fam}
+# we will keep the order of the rows in this file
+fam1 <-
+  read.delim(
+    file   = here(
+      "output", "gwas", "file1.fam"
+    ),
+    header = FALSE,
+    
+  )
+head(fam1)
+```
+
+We can merge the tibbles.
+```{r merge_objects1}
+# to keep the same order of the .fam file, we will first create an index based on the numbers of the samples, then use it too keep the order
+
+# Extract the number part from the columns
+fam1_temp <- fam1 |>
+  mutate(num_id = as.numeric(str_extract(V2, "^\\d+")))
+
+samples_temp <- samples |>
+  mutate(num_id = as.numeric(str_extract(Sample.Filename, "^\\d+")))
+
+# Perform the left join using the num_id columns and keep the order of fam1
+df <- fam1_temp |>
+  left_join(samples_temp, by = "num_id") |>
+  select(-num_id) |>
+  select(8:13)
+
+# check the data frame
+head(df)
+```
+
+We can check how many samples we have in our file
+```{r check_number_samples_df}
+nrow(df)
+```
+
+Before you save the new fam file, you can change the original file to a different name, to compare the order later. If you want to repeat the steps above after you saving the new file1.fam, you will need to import the vcf again.
+
+```{r save_new_fam_file}
+#   ____________________________________________________________________________
+#   save calculation to load later                                          ####
+write.table(
+  df,
+  file      = here(
+    "output", "gwas", "file1.fam"
+  ),
+  sep       = "\t",
+  row.names = FALSE,
+  col.names = FALSE,
+  quote     = FALSE
+)
+```
+
+Check the new .fam file to see if has the order and the sample attributes we want.
+
+```{bash, cache=TRUE}
+# you can open the file on a text editor and double check the sample order and information.
+head -n 5 output/gwas/file1.fam
+```
+
+
+## 3. Quality control steps
+
+### 3.1 Missingness
+
+```{bash plink2_filter_SNP}
+plink2 \
+--allow-extra-chr \
+--bfile output/gwas/file1 \
+--geno 0.2                `# we set genotype missiningness to 20% with this option` \
+--make-bed \
+--out output/gwas/file2 \
+--silent \
+--missing;                 # --missing produces sample-based and variant-based missing data reports. If run with --within/--family, the variant-based report is stratified by cluster.
+grep "variants" output/gwas/file2.log
+```
+
+Make plot
+```{r plot_ind_missingness, cache=TRUE}
+#   ____________________________________________________________________________
+#   import individual missingness                                           ####
+indmiss <-                                              # name of the data frame we are creating
+  read.delim(                                           # use function read table
+    file   = here(
+      "output", "gwas", "file2.smiss"
+    ),                                                  # we use library here to import file2.imiss from data/QC
+    header = TRUE                                       # we do have headers in our file
+  )
+#   ____________________________________________________________________________
+#   import SNP missingness                                                  ####
+snpmiss <-
+  read.delim(
+    file   = here(
+      "output", "gwas", "file2.vmiss"
+    ),
+    header = TRUE
+  )
+```
+
+Plot individual missingness
+```{r plot_individual_missingness, cache=TRUE}
+# This code uses the ggplot2 package to create a histogram of the variable F_MISS from the dataset indmiss. The code customizes several aspects of the plot to improve its clarity and visual appeal.
+#
+# The geom_histogram function specifies the color and fill of the bars, as well as the number of bins to use. The stat_bin function adds text labels to each bin indicating the number of observations in that bin. The geom_vline function adds a vertical dotted line at the position of the mean of F_MISS, while geom_text adds a text label indicating the value of the mean as a percentage.
+#
+# The labs function is used to label the x and y axes of the plot, while theme_minimal customizes the font and size of the plot elements. The scale_x_continuous function modifies the x-axis to display percentages, and the theme function further modifies the appearance of the grid lines and axis labels.
+#
+# Overall, this code provides a clear and visually appealing representation of the distribution of F_MISS in the indmiss dataset.
+
+# load plotting theme
+source(
+  here(
+    "scripts", "analysis", "my_theme2.R"
+  )
+)
+
+ggplot( # Start a ggplot object with the data and aesthetic mappings
+  indmiss,
+  aes(
+    x = F_MISS
+  )
+) +
+  geom_histogram( # Add a histogram layer
+    color            = "black",
+    fill             = "#B6FAD7",
+    bins             = 6
+  ) +
+  geom_text(
+    # Add text labels for bin counts
+    stat             = "bin",
+    aes(
+    label = after_stat(count)
+  ),
+    vjust            = -0.5,
+    color            = "purple",
+    size             = 3,
+    bins             = 6
+  ) +
+  geom_vline(
+    # Add a vertical line at the mean of F_MISS
+    aes(
+    xintercept = mean(F_MISS)),
+    color            = "orange",
+    linetype         = "dotted",
+    linewidth        = .5
+  ) +
+  geom_text(
+    # Add a text label for the mean of F_MISS
+    aes(
+      x = mean(F_MISS),
+      y = 75,
+      label = paste0(
+        "Mean \n",
+        scales::percent(mean(F_MISS),
+          accuracy = 0.01
+        )
+      )
+    ),
+    size = 3,
+    color = "orange",
+    hjust = -.1
+  ) +
+  labs( # Add axis labels
+    x                = "Individual Missingness (%)",
+    y                = "Frequency (n)"
+  ) +
+  my_theme() +
+  scale_x_continuous( # Scale the x-axis to display percentages
+    labels           = scales::percent,
+    n.breaks         = 6
+  )
+#
+# save the plot
+ggsave(
+  here(
+    "output", "gwas", "figures" , "individual_missingness.pdf"
+  ),
+  width              = 7,
+  height             = 5,
+  units              = "in"
+)
+```
+
+The function my_theme() that we imported above
+```{r function_theme}
+# Define a function to customize the theme
+my_theme <- function() {
+  theme_minimal(base_size = 12, base_family = "") +
+    theme(
+      panel.grid.major = element_line(
+        linetype = "dashed",
+        linewidth = 0.2,
+        color = "pink"
+      ),
+      panel.grid.minor = element_line(
+        linetype = "dashed",
+        linewidth = 0.2,
+        color = "pink"
+      ),
+      # Customize the x-axis label
+      axis.title.x = element_text(
+        angle          = 0,
+        hjust          = 1,
+        face           = "bold"
+      ),
+      # Customize the y-axis label
+      axis.title.y = element_text(
+        angle          = 90,
+        hjust          = 1,
+        face           = "bold"
+      )
+    )
+}
+# we can save the function to source it later
+dump(                                                    # check ?dump for more information
+  "my_theme",                                            # the object we want to save
+  here(
+    "scripts", "analysis", "my_theme2.R")                # use here to save it our function as .R 
+)
+```
+
+Plot variant missingness
+```{r plot_variant_missingness, cache=TRUE}
+# This plot takes a while to compute
+# This code creates a histogram from the indmiss data set using the F_MISS column.
+# ggplot builds a histogram of individual missingness data
+ggplot(
+  snpmiss,
+  aes(
+    x = F_MISS
+  )
+) +
+  geom_histogram(
+    color = "black",
+    fill = "#B6FAD7",
+    bins = 6
+  ) +
+  stat_bin(
+    geom = "text",
+    aes(
+      label = format(
+        after_stat(count),
+        big.mark = ",",
+        scientific = FALSE
+      )
+    ),
+    vjust = -0.5,
+    color = "purple",
+    size = 2,
+    bins = 6
+  ) +
+  geom_vline(
+    aes(
+      xintercept = mean(F_MISS)
+    ),
+    color = "orange",
+    linetype = "dotted",
+    linewidth = 0.5
+  ) +
+  geom_text(
+    aes(
+      x = mean(F_MISS),
+      y = 16000,
+      label = paste0(
+        "Mean \n",
+        scales::percent(mean(F_MISS),
+          accuracy = 0.01
+        )
+      )
+    ),
+    size = 3,
+    color = "orange",
+    # hjust = 1.5,
+    vjust = -.2
+  ) +
+  labs(
+    x = "Variant Missingness (%)",
+    y = "Frequency (n)"
+  ) +
+  # theme_minimal(
+  #   base_size = 12,
+  #   base_family = "Roboto Condensed"
+  # ) +
+  scale_x_continuous(
+    labels = scales::percent,
+    n.breaks = 6
+  ) +
+  scale_y_continuous(
+    labels = scales::label_comma(),
+    n.breaks = 5
+  ) +
+  my_theme()
+
+# save the plot
+ggsave(
+  here(
+    "output", "gwas", "figures", "SNPs_missingness.pdf"
+  ),
+  width  = 7,
+  height = 5,
+  units  = "in"
+)
+```
+
+Remove individuals missing more than 20% of SNPs. You can use the threshold you want, change the flag --mind
+
+```{bash plink2_filter_ind}
+plink2 \
+--allow-extra-chr \
+--bfile output/gwas/file2 \
+--mind 0.2               `# here we set the individual missingness threshold of 20%`\
+--make-bed \
+--out output/gwas/file3 \
+--silent;
+grep "samples\|variants" output/gwas/file3.log
+```
+We did not remove any SNP due to individual missingness
+
+### 3.2 Minor allele frequency
+
+First lets make a plot of the MAF. First, we estimate the allele frequency with Plink.
+```{bash plink2_MAF_check, eval=FALSE}
+plink2 \
+--allow-extra-chr \
+--bfile output/gwas/file3 \
+--freq \
+--out output/gwas/MAF_check \
+--silent
+```
+
+Then we plot it with ggplot.
+
+```{r import_MAF}
+#   ____________________________________________________________________________
+#   Import MAF data                                                         ####
+maf_freq <-
+  read.delim(
+    here(
+      "output", "gwas", "MAF_check.afreq"
+    ),
+    header = TRUE
+  )
+```
+
+Make MAF plot
+```{r plot_MAF}
+#   ____________________________________________________________________________
+#   make the plot                                                           ####
+ggplot(
+  maf_freq,
+  aes(ALT_FREQS)
+) +
+  geom_histogram(
+    colour = "black",
+    fill = "#C4F3F5",
+    bins = 40
+  ) +
+  labs(
+    x = "Minor Allele Frequency (MAF)",
+    y = "Frequency (n)",
+    caption = "<span style='color:red;'><i>Red</i></span> <span style='color:black;'><i>line at</i></span><span style='color:red;'><i> MAF 5%</i></span><span style='color:black;'><i> threshold</i></span>."
+  ) +
+  geom_text(
+    aes(
+      x = 0.5,
+      y = 8000,
+      label = paste0("16,694 SNPs")
+    ),
+    size = 3,
+    color = "blue",
+    vjust = -.2
+  ) +
+  geom_vline(xintercept = 0.05, color = "red") +
+  my_theme() +
+  theme(plot.caption = element_markdown()) +
+  scale_y_continuous(label = scales::number_format(big.mark = ",")) +
+  scale_x_continuous(breaks = c(0, 0.1, 0.2, 0.4, 0.6, 0.8, 1))
+#   ____________________________________________________________________________
+#   save the plot                                                           ####
+ggsave(
+  here(
+    "output", "gwas", "figures", "MAF.pdf"
+  ),
+  width  = 5,
+  height = 4,
+  units  = "in"
+)
+```
+
+Now we apply the MAF filter.
+```{bash filter_MAF, cache=TRUE, eval=FALSE}
+# We will use MAF of 10%
+plink2 \
+--allow-extra-chr \
+--bfile output/gwas/file3 \
+--maf 0.01 \
+--make-bed \
+--out output/gwas/file4 \
+--silent;
+grep "variants" output/gwas/file4.log
+```
+
+Create dir for HWE test
+
+```{bash mkdirs_4_HWE}
+mkdir -p output/gwas/hardy;
+cp output/gwas/file4.* output/gwas/hardy
+```
+
+### 3.3 HWE test
+
+Now we can run the HWE test. However, we will need to apply the SNP missingness again for each
+population. If we do not, the HWE will vary widely. With the bash script below, we will create a new
+file for each population, run the HWE test with HWE p value \<1e‐6 (HWE p value \<1e‐6). Then, we
+ask Plink to generate a list of SNPs that passed the test for each population.
+
+```{bash loop_filter_HWE}
+for fam in $(awk '{print $1}' output/gwas/hardy/file4.fam | sort | uniq); 
+do 
+echo $fam | \
+plink2 \
+--allow-extra-chr \
+--silent \
+--keep-allele-order \
+--bfile output/gwas/hardy/file4 \
+--keep-fam /dev/stdin \
+--make-bed \
+--out output/gwas/hardy/$fam \
+--hwe 0.000001 \
+--geno 0.1 \
+--write-snplist; \
+done
+```
+
+Next, we use "cat" and "`awk`" to concatenate the SNP list from all gwas, and remove
+duplicates. Once we have a list of SNPs that passed the test for each population, we can use Plink
+to create a new bed file keeping only the SNPs that passed the test in each population.
+First, lets get the list of SNPs, and count how many passed:
+
+```{bash get_SNP_list_after_HWE, eval=FALSE}
+cat output/gwas/hardy/*.snplist | awk '!a[$0]++' > output/gwas/passed_hwe.txt;
+wc -l output/gwas/passed_hwe.txt
+```
+
+How many variants we had before
+
+```{bash check_n_variants_before_HWE}
+cat output/gwas/file4.bim | awk '{print $2}'| awk '!a[$0]++' | wc -l
+```
+
+Variants not passing HWE test
+```{r}
+97495 - 95644
+```
+
+Remove variants failing HWE test
+```{bash}
+# We will use MAF of 10%
+plink2 \
+--allow-extra-chr \
+--bfile output/gwas/file4 \
+--extract output/gwas/passed_hwe.txt \
+--make-bed \
+--out output/gwas/file41 \
+--silent;
+grep "variants" output/gwas/file41.log
+```
+
+
+### 3.4 Scaffold sizes
+
+
+```{r}
+#   ____________________________________________________________________________
+#   import the file with the scaffold sizes                                 ####
+scaffold_bps <-
+  read_delim(
+    here(
+      "data", "genome", "scaffold_sizes.txt"
+    ),
+    col_names      = FALSE,
+    show_col_types = FALSE,
+    col_types      = "cn"
+  )
+#
+# set column names
+colnames(
+  scaffold_bps
+) <- c(
+  "Scaffold", "Size"
+)
+#   ____________________________________________________________________________
+#   create new column with the chromosome number                            ####
+sizes <-
+  scaffold_bps |>
+  mutate(
+    Chromosome = case_when( # we use mutate to create a new column called Chromosome
+      startsWith(
+        Scaffold, "1"
+      ) ~ "1",              # use startsWith to get Scaffold rows starting with 1 and output 1 on Chromosome column
+      startsWith(
+        Scaffold, "2"
+      ) ~ "2",
+      startsWith(
+        Scaffold, "3"
+      ) ~ "3"
+    )
+  )
+#
+# group by Chromosome and get row with highest Size value
+df_max <-
+  sizes |>
+  group_by(
+    Chromosome
+  ) |>
+  slice_max(
+    Size
+  )
+#
+# check the largest scaffoldfor each chromosome
+df_max |>
+  mutate(
+    Size_Mb = Size/1e6
+  )
+```
+
+The largest scaffolds of chromosome 2 is 43Mb, and chromosome 3 is 25Mb. We can also take a look at the size distribution of the scaffolds using ggplot2.
+
+```{r scaffold_size_distribution, cache=TRUE}
+# create histogram using ggplot2
+source(
+  here(
+    "scripts", "analysis", "my_theme2.R"
+  )
+)
+
+ggplot(
+  sizes,
+  aes(
+    x = Size
+  )
+) +
+  geom_histogram(
+    binwidth = 1e6,
+    aes(fill = factor(
+      Chromosome
+    )),
+    color = "lightgray"
+  ) +
+  labs(
+    title = "Scaffold sizes per chromosome",
+    x = "Scaffold Size (Mb)",
+    y = "Count (n)"
+  ) +
+  # xlab("Scaffold Size (Mb)") +
+  # ylab("Count (n)") +
+  my_theme() +
+  scale_x_continuous(
+    labels = comma_format(
+      scale = 1e-6
+    )
+  ) +
+  facet_wrap(
+    ~Chromosome,
+    ncol = 3,
+    scales = "free_x"
+  ) +
+  scale_fill_manual(
+    values = c(
+      "pink", "green", "orange"
+    )
+  ) +
+  guides(fill = "none")
+```
+
+### 3.5 Create chromosomal scale
+
+Import the .bim file with the SNPs to create a new chromosomal scale.
+
+```{r import_bim_file}
+#   ____________________________________________________________________________
+#   import the bim file with the SNP data                                   ####
+snps <-
+  read_delim(                    # to learn about the options use here, run ?read_delim on the console.
+    here(
+      "output", "gwas", "file41.bim"
+    ),                           # use library here to load it
+    col_names      = FALSE,      # we don't have header in the input file
+    show_col_types = FALSE,      # suppress message from read_delim
+    col_types      = "ccidcc"    # set the class of each column
+  )
+#
+# set column names
+colnames(
+  snps
+) <-                             # to add a header in our tibble
+  c(
+    "Scaffold", "SNP", "Cm", "Position", "Allele1", "Allele2"
+  )
+#
+# check the tibble
+head(snps)
+```
+
+We can write a function to import the bim files.
+
+```{r import_bim_function, eval=FALSE}
+#   ____________________________________________________________________________
+#   function to import bim files                                            ####
+#
+import_bim <- function(file) {
+  # import as a tibble and set columns as integers
+  bim <-
+    read_delim(
+      file,
+      col_names      = FALSE,
+      show_col_types = FALSE,
+      col_types      = "ccidcc"
+    )
+  # rename the columns by index
+  bim <- bim |>
+    rename(
+      Scaffold = 1,
+      SNP      = 2,
+      Cm       = 3,
+      Position = 4,
+      Allele1  = 5,
+      Allele2  = 6
+    )
+  return(bim)
+}
+# we can save the function to source it later
+dump(                                                     # check ?dump for more information
+  "import_bim",                                           # the object we want to save
+  here(
+    "scripts", "analysis", "import_bim.R")       # use here to save it our function as .R 
+)
+```
+
+Separate the tibbles into each chromosome.
+
+```{r separate_data_into_chroms}
+#   ____________________________________________________________________________
+#   separate the SNP data per chromosome                                    ####
+# chr1
+chr1_snps <-
+  snps |>
+  filter(
+    str_detect(
+      Scaffold, "^1."
+    )
+  ) |> # here we get only Scaffold rows starting with 1
+  as_tibble() # save as tibble
+#
+# chr2
+chr2_snps <-
+  snps |>
+  filter(
+    str_detect(
+      Scaffold, "^2."
+    )
+  ) |>
+  as_tibble()
+#
+# chr3
+chr3_snps <-
+  snps |>
+  filter(
+    str_detect(
+      Scaffold, "^3."
+    )
+  ) |>
+  as_tibble()
+```
+
+Now we can index the reference genome with the new scaffold names that mach our .bim file
+
+```{bash index_genome_updated_scaffold_names, eval=FALSE}
+# index the genome
+samtools faidx data/genome/albo.fasta.gz 
+```
+
+
+Now we can get the scaffold order and their size from the `.fai` file. Check the about it at `Samtools` documentation
+[HERE](http://www.htslib.org/doc/faidx.html).
+
+```{bash scaffold_order_by_chr, eval = FALSE}
+# check the head of the .fai file
+head data/genome/albo.fasta.gz.fai
+# For each row:
+# Column 1: The scaffold name. In our FASTA file, this is preceded by '>'
+# Column 2: The number of bases in the scaffol
+# Column 3: The byte index of the file where the scaffold sequence begins.
+# Column 4: bases per line in the FASTA file
+# Column 5: bytes per line in the FASTA file
+# 
+# we can use awk to get the first two columns, I also change the field separator.
+cat data/genome/albo.fasta.gz.fai | awk 'BEGIN{FS=" "; OFS="\t"} {print $1, $2}' > data/genome/scaffold_sizes.txt;
+echo "scaffold sizes";
+# check the output
+head data/genome/scaffold_sizes.txt
+# since we fixed the scaffold order previous, and also moved the scaffold 1.86 to its correct position, we can move ahead and calculate the new scale for our SNPs.
+```
+
+Import the file with sizes of each scaffold.
+
+```{r}
+#   ____________________________________________________________________________
+#   import the file with the scaffold sizes                                 ####
+sizes <-
+  read_delim(
+    here(
+      "data", "genome", "scaffold_sizes.txt"
+    ),
+    col_names      = FALSE,
+    show_col_types = FALSE,
+    col_types      = "cd"
+  )
+#
+# set column names
+colnames(
+  sizes
+) <- c(
+  "Scaffold", "Size"
+)
+#   ____________________________________________________________________________
+#   create new column with the chromosome number                            ####
+sizes <- 
+  sizes |>
+  mutate(
+    Chromosome = case_when( # we use mutate to create a new column called Chromosome
+      startsWith(
+        Scaffold, "1"
+      ) ~ "1", # use startsWith to get Scaffold rows starting with 1 and output 1 on Chromosome column
+      startsWith(
+        Scaffold, "2"
+      ) ~ "2",
+      startsWith(
+        Scaffold, "3"
+      ) ~ "3"
+    )
+  ) |>
+  arrange(
+    Scaffold
+  )                   # to sort the order of the scaffolds, fixing the problem we have with scaffold 1.86
+# check it
+head(sizes)
+```
+
+Create new scale. Get the scaffolds for each chromosome.
+
+```{r get_list_scaffolds_per-chr}
+#   ____________________________________________________________________________
+#   separate the scaffold sizes tibble per chromosome                       ####
+# chr1
+chr1_scaffolds <- 
+  sizes |>
+  filter(
+    str_detect(
+      Scaffold, "^1" # we use library stringr to get scaffolds starting with 1 (chromosome 1)
+    )
+  ) |> 
+  as_tibble()
+#
+# chr2
+chr2_scaffolds <-
+  sizes |>
+  filter(
+    str_detect(
+      Scaffold, "^2" # we use library stringr to get scaffolds starting with 2 (chromosome 2)
+    )
+  ) |> 
+  as_tibble()
+#
+# # chr3
+chr3_scaffolds <-
+  sizes |>
+  filter(
+    str_detect(
+      Scaffold, "^3" # we use library stringr to get scaffolds starting with 3 (chromosome 3)
+    )
+  ) |>
+  as_tibble()
+```
+
+Create a scale for each chromosome.
+
+```{r create_chr_scale}
+#   ____________________________________________________________________________
+#   create a new scale for each chromosome                                  ####
+# chr1
+chr1_scaffolds$overall_size_before_bp <-
+  0                                                                        # we create a new column with zeros
+for (i in 2:nrow(
+  chr1_scaffolds
+)
+) {                                                                        # loop to start on second line
+  chr1_scaffolds$overall_size_before_bp[i] <-                              # set position on the scale
+    chr1_scaffolds$overall_size_before_bp[i - 1] + chr1_scaffolds$Size[i - # add the scaffold size and the location to get position on new scale
+      1]
+}
+#
+# chr2
+chr2_scaffolds$overall_size_before_bp <- 0
+for (i in 2:nrow(
+  chr2_scaffolds
+)
+) {
+  chr2_scaffolds$overall_size_before_bp[i] <-
+    chr2_scaffolds$overall_size_before_bp[i - 1] + chr2_scaffolds$Size[i -
+      1]
+}
+#
+# chr3
+chr3_scaffolds$overall_size_before_bp <- 0
+for (i in 2:nrow(
+  chr3_scaffolds
+)
+) {
+  chr3_scaffolds$overall_size_before_bp[i] <-
+    chr3_scaffolds$overall_size_before_bp[i - 1] + chr3_scaffolds$Size[i -
+      1]
+}
+```
+
+Merge the data frames scaffolds and SNPs.
+
+```{r merge_snps_scales}
+#   ____________________________________________________________________________
+#   merge the data sets using the tidyverse function left_join              ####
+# chr1
+chr1_scale <-
+  chr1_snps |>          # create data frame for each chromosome, get chr1_snps
+  left_join(            # use lef_join function to merge it with chr1_scaffolds
+    chr1_scaffolds,
+    by = "Scaffold"
+  ) |>                  # set column to use for merging (Scaffold in this case)
+  na.omit() |>          # remove NAs, we don't have SNPs in every scaffold
+  mutate(
+    midPos_fullseq = as.numeric(
+      Position
+    ) +                 # make new columns numeric
+      as.numeric(
+        overall_size_before_bp
+      )
+  )
+#
+# chr2
+chr2_scale <-
+  chr2_snps |>
+  left_join(
+    chr2_scaffolds,
+    by = "Scaffold"
+  ) |>
+  na.omit() |>
+  mutate(
+    midPos_fullseq = as.numeric(
+      Position
+    ) +
+      as.numeric(
+        overall_size_before_bp
+      )
+  )
+#
+# chr3
+chr3_scale <-
+  chr3_snps |>
+  left_join(
+    chr3_scaffolds,
+    by = "Scaffold"
+  ) |>
+  na.omit() |>
+  mutate(
+    midPos_fullseq = as.numeric(
+      Position
+    ) +
+      as.numeric(
+        overall_size_before_bp
+      )
+  )
+```
+
+Merge all chromosome scales.
+
+```{r bind_chr_scales}
+#   ____________________________________________________________________________
+#   merge the data sets, and select only the columns we need                ####
+chroms <- rbind(
+  chr1_scale, chr2_scale, chr3_scale
+) |>
+  select(
+    Chromosome, SNP, Cm, midPos_fullseq, Allele1, Allele2
+  )
+# check it
+head(chroms)
+```
+
+Save the new .bim file
+
+```{r save_new_bim_file}
+#   ____________________________________________________________________________
+#   save the new bim file with a new name, I added "B"                      ####
+write.table(
+  chroms,
+  file      = here(
+    "output", "gwas", "file41B.bim"
+  ),
+  sep       = "\t",
+  row.names = FALSE,
+  col.names = FALSE,
+  quote     = FALSE
+)
+```
+
+Check bim file
+
+```{bash}
+head output/gwas/file41.bim
+```
+
+Rename the .bim files
+```{bash change_name_bim_file}
+# change the name of the first .bim file, for example, append _backup.bim, and then replace the original file
+mv output/gwas/file41.bim output/gwas/file41_backup.bim;
+# than change the new bim we create to the original name (do it only once, otherwise it will mess up)
+mv output/gwas/file41B.bim output/gwas/file41.bim
+```
+
+Check bim file
+
+```{bash}
+head output/gwas/file41.bim
+```
+
+Create a new bed file with Plink2 to see if it works. For example, to see if the variants are in the
+right order. Plink2 will give us a warning.
+
+```{bash test_new_scale}
+plink2 \
+--bfile output/gwas/file41 \
+--make-bed \
+--out output/gwas/test01;
+# then we remove the files 
+rm output/gwas/test01.*
+```
+
+No warnings from Plink2. Now, we can go ahead with our analysis.
+
+### 3.8 LD prunimng
+
+```{bash, cache=TRUE}
+# we set a window of variants of 5 and move the window 1 variant per time, removing 1 of the variants with lowest MAF from a pair above the threshold of r^2 > 0.1
+# the mean distance is 203kb across the tested gwas. Try --indep-pairwise 200kb 1 0.1
+plink2 \
+--allow-extra-chr \
+--bfile output/gwas/file41 \
+--indep-pairwise 5 1 0.1 \
+--out output/gwas/indepSNP_chr \
+--silent;
+grep 'pairwise\|variants\|samples' output/gwas/indepSNP_chr.log
+```
+
+
+### 3.9 Heterozygosity
+```{bash plink1.9_estimate_heterozygosity, cache=TRUE}
+plink2 \
+--allow-extra-chr \
+--bfile output/gwas/file41 \
+--extract output/gwas/indepSNP_chr.prune.in \
+--het \
+--out output/gwas/R_check \
+--silent;
+grep 'variants' output/gwas/R_check.log
+```
+
+We can see that we started with 92,693 SNPs, then we only extract those that are not "linked" from
+the "indepSNP_chr.prune.in" file. We used these SNPs to estimate heterozygosity. Now we can use R to
+part the R_check.het, to find the individuals with excess heterozygosity. We will remove any
+individual that deviates more the 3 standard deviations from the mean heterozygosity of the data
+set. The code below will create a list of individuals with excess heterozygosity (file named
+"`fail-het-qc.txt`"), and make a heterozygosity plot for the entire data set.
+
+```{r plot_heterozygosity, cache=TRUE}
+#   ____________________________________________________________________________
+#   find individuals with high heterozygosity                              ####
+# import the data from Plink
+het <- read.delim(
+  here(
+    "output", "gwas", "R_check.het"
+  ),
+  head = TRUE
+)
+#
+# check head of the file
+colnames(het)
+```
+
+Estimate het
+```{r calculate_het, cache=TRUE}
+# create a column named HET_RATE and calculate the heterozygosity rate
+het$HET_RATE <- (het$"OBS_CT" - het$"O.HOM") / het$"OBS_CT"
+#
+# use subset function to get values deviating from 4sd of the mean heterozygosity rate.
+het_fail <-
+  subset(
+    het, (het$HET_RATE < mean(
+      het$HET_RATE
+    ) - 4 * sd(
+      het$HET_RATE
+    )) |
+      (het$HET_RATE > mean(
+        het$HET_RATE
+      ) + 4 * sd(
+        het$HET_RATE
+      ))
+  )
+#
+# get the list of individuals that failed our threshold of 4sd from the mean.
+het_fail$HET_DST <-
+  (het_fail$HET_RATE - mean(
+    het$HET_RATE
+  )) / sd(
+    het$HET_RATE
+  )
+```
+
+Save the files to use with Plink
+
+```{r save_list_fail_het, cache=TRUE}
+#   ____________________________________________________________________________
+#   save the data to use with Plink2                                        ####
+#
+write.table(
+  het_fail,
+  here(
+    "output", "gwas", "fail-het-qc.txt"
+  ),
+  row.names = FALSE
+)
+het_fail
+```
+
+Make plot
+```{r plot_het, cache=TRUE}
+# source the plotting function
+source(
+  here(
+    "scripts", "analysis", "my_theme2.R"
+  )
+)
+# source the plotting function
+source(
+  here(
+    "scripts", "analysis", "my_theme2.R"
+  )
+) 
+#   ____________________________________________________________________________
+#   make a heterozygosity plot                                              ####
+#
+ggplot(
+  het,
+  aes(
+    HET_RATE
+  )
+) +
+  geom_histogram(
+    colour           = "black",
+    fill             = "#CDFAF8",
+    bins             = 40
+  ) +
+  labs(
+    x                = "Heterozygosity Rate",
+    y                = "Number of Individuals"
+  ) +
+  geom_vline(
+    aes(
+      xintercept     = mean(
+        HET_RATE
+      )
+    ),
+    col              = "#F2C46F",
+    linewidth        = 1.5
+  ) +
+  geom_vline(
+    aes(
+      xintercept     = mean(
+        HET_RATE
+      ) + 4 * sd(
+        HET_RATE
+      )
+    ),
+    col              = "#BFB9B9",
+    linewidth        = 1
+  ) +
+  geom_vline(
+    aes(
+      xintercept     = mean(
+        HET_RATE
+      ) - 4 * sd(
+        HET_RATE
+      )
+    ),
+    col              = "#BFB9B9",
+    linewidth        = 1
+  ) + 
+  my_theme() +
+  scale_y_continuous(
+    labels           = comma
+  )
+#   ____________________________________________________________________________
+#   save the heterozygosity plot                                            ####
+ggsave(
+  here(
+    "output", "gwas", "figures", "Heterozygosity.pdf"
+  ),
+  width  = 5,
+  height = 4,
+  units  = "in"
+)
+```
+
+The red line in the plot above indicates the mean, and the orange line indicate 4 standard deviation
+from the mean. We can see that some mosquitoes do have excess heterozygous sites. We will remove
+them. We can get their ID from the file "`fail-het-qc.txt`". We can use the bash script below to
+parse the file to use with Plink
+
+```{bash parse_R_het_output, cache=TRUE}
+sed 's/"// g' output/gwas/fail-het-qc.txt | awk '{print$1, $2}'> output/gwas/het_fail_ind.txt;
+echo 'How many mosquitoes we need to remove from our data set:';
+cat output/gwas/het_fail_ind.txt | tail -n +2 | wc -l;
+echo 'Which mosquitoes we have to remove:';
+tail -n +2 output/gwas/het_fail_ind.txt
+```
+The population from Nepal has high heterozygosity reate. We will remove 4 individuals from this population and one from QNC
+
+Next, we will remove these mosquitoes from our data set using Plink:
+```{bash plink2_remove_fail_het, cache=TRUE, eval=FALSE}
+plink2 \
+--allow-extra-chr \
+--bfile output/gwas/file41 \
+--remove output/gwas/het_fail_ind.txt \
+--make-bed \
+--out output/gwas/file5 \
+--silent;
+grep 'variants\|samples' output/gwas/file5.log
+```
+
+### 3.10 Relatedness
+
+Check for cryptic relatedness. Check Plink2 documentation
+<https://www.cog-genomics.org/plink/2.0/distance> You can download King directly
+<https://www.kingrelatedness.com/manual.shtml> or check their manuscript
+<https://www.ncbi.nlm.gwas.gov/pmc/articles/PMC3025716/pdf/btq559.pdf>
+From Plink2 documentation: "Note that KING kinship coefficients are scaled such that duplicate
+samples have kinship 0.5, not 1. First-degree relations (parent-child, full siblings) correspond to
+\~0.25, second-degree relations correspond to \~0.125, etc. It is conventional to use a cutoff of
+\~0.354 (the geometric mean of 0.5 and 0.25) to screen for monozygotic twins and duplicate samples,
+\~0.177 to add first-degree relations, etc." There two options. One is to run only --make-king and
+another one is to use --make-king-table We will use the threshold of 0.354 and create a table.
+
+
+```{bash plink2_make_king, cache=TRUE}
+# Plink2 will create a file with extension .king
+plink2 \
+--allow-extra-chr \
+--bfile output/gwas/file5 \
+--extract output/gwas/indepSNP_chr.prune.in \
+--make-king-table rel-check \
+--king-table-filter 0.354 \
+--out output/gwas/file5 \
+--silent;
+grep 'variants\|samples' output/gwas/file5.log
+```
+
+Check the individuals that did not pass our filtering.
+
+```{bash check_kin0, cache=TRUE}
+head output/gwas/file5.kin0
+```
+
+We want to remove one of the individuals of the pairs.
+```{bash remove_related1}
+plink2 \
+--allow-extra-chr \
+--bfile output/gwas/file5 \
+--extract output/gwas/indepSNP_chr.prune.in \
+--make-king triangle bin \
+--out output/gwas/file6 \
+--silent;
+grep 'variants\|samples' output/gwas/file6.log
+```
+
+Now we can use Plink2 to remove one of the mosquitoes from the pair with high kinship. It will
+remove 50 samples since we had 2 samples in some gwas with high relatedness, and we could
+remove 1 and keep the other two. Plink2 always tries to maximize the number of samples passing the
+filters.
+```{bash remove_related2}
+plink2 \
+--allow-extra-chr \
+--bfile output/gwas/file5 \
+--extract output/gwas/indepSNP_chr.prune.in \
+--king-cutoff output/gwas/file6 0.354 \
+--make-bed \
+--out output/gwas/file7 \
+--silent;
+grep 'samples\|variants\|remaining' output/gwas/file7.log
+```
+
+Now we can check the individuals that were removed.
+```{bash check_id_removed_individuals}
+# we have 49 samples that were removed
+head -n 100 output/gwas/file7.king.cutoff.out.id;
+wc -l output/gwas/file7.king.cutoff.out.id
+```
+
+### 3.11 Quick PCA with Plink using the LD pruned data
+
+```{bash plink_pca}
+plink2 \
+--allow-extra-chr \
+--bfile output/gwas/file7 \
+--pca allele-wts \
+--freq \
+--out output/gwas/pca_blocks \
+--silent;
+grep 'samples\|variants' output/gwas/pca_blocks.log
+```
+
+Check the files
+```{bash check_eigenvec}
+head -n 2 output/gwas/pca_blocks.eigenvec
+```
+
+```{bash check_eigenval}
+head -n 2 output/gwas/pca_blocks.eigenval
+```
+
+Import PCA data
+```{r import_pca}
+# import the data from Plink
+pca <- read.delim(
+  here(
+    "output", "gwas", "pca_blocks.eigenvec"
+  ),
+  head = TRUE
+)
+ 
+# check head of the file
+head(pca)
+```
+
+```{r}
+# import the data from Plink
+fam_pca <- read.delim(
+  here(
+    "output", "gwas", "file7.fam"
+  ),
+  head = FALSE
+)
+ 
+# Create bins of 0.25 for the V6 column
+fam_pca$V6_bins <-
+  cut(
+    fam_pca$V6,
+    breaks = c(0, 0.25, 0.5, 0.75, 1),
+    include.lowest = TRUE,
+    labels = c("0-0.25", "0.25-0.5", "0.5-0.75", "0.75-1")
+  )
+
+# To see the changes
+head(fam_pca)
+```
+
+
+
+Check number of samples per population
+```{r pca_sample_count}
+blocks_pca <- 
+  pca |>
+  group_by(X.FID) |>
+  summarize(count_distinct = n_distinct(IID))
+
+# check it
+head(blocks_pca)
+```
+
+
+Make plot1
+```{r simple_pca_plot1}
+# source the plotting function
+source(
+  here(
+    "scripts", "analysis", "my_theme2.R"
+  )
+)
+
+colorblind_palette <-
+  c(
+    "#E69F00",
+    "#56B4E9",
+    "#009E73",
+    "#F0E442",
+    "#0072B2",
+    "#D55E00",
+    "#CC79A7",
+    "#800000",
+    "#808080",
+    "#CCEBC5",
+    "#FFB5B8",
+    "#99CCFF",
+    "#8E8BFF"
+  )
+
+# make plot by continent and range
+ggplot(pca, aes(PC1, PC2)) +
+  geom_point(aes(fill = X.FID), shape = 21) +
+  xlab("PC1 (22.70% Variance)") +
+  ylab("PC2 (18.87% Variance)") +
+  labs(
+    caption = "Principal Component Analysis with 28,761 SNPs from 485 mosquitoes within the 5 blocks.") +
+  guides(
+    fill = guide_legend(title = "Blocks", order = 1, override.aes = list(shape = 21))#,
+  ) +
+  scale_color_manual(values = colorblind_palette) + # Use colorblind_palette
+  my_theme() +
+  theme(
+    plot.caption = element_text(face = "italic"),
+    legend.position = "right",
+    legend.justification = "top", # set the legend to the top
+    legend.box.just = "center",
+    legend.box.background = element_blank(), # remove the legend border
+    plot.margin = margin(5.5, 30, 5.5, 5.5, "points"), # increase right margin
+    legend.margin = margin(10,10,10,10) # move the legend a bit up
+  )
+
+
+#   ____________________________________________________________________________
+#   save the pca plot                                                       ####
+ggsave(
+  here(
+    "output", "gwas", "figures", "PCA_blocks.pdf"
+  ),
+  width  = 10,
+  height = 6,
+  units  = "in"
+)
+```
+Merge objects
+```{r}
+# Merge fam_pca and pca dataframes
+merged_data <- merge(fam_pca, pca, by.x = "V2", by.y = "IID")
+
+# To see the merged dataframe
+head(merged_data)
+```
+
+Plot it
+```{r}
+# make plot by continent and range
+ggplot(merged_data, aes(PC1, PC2)) +
+  geom_point(aes(fill = V6_bins), shape = 21) +
+  xlab("PC1 (22.70% Variance)") +
+  ylab("PC2 (18.87% Variance)") +
+  labs(
+    caption = "Principal Component Analysis with 28,761 SNPs from 485 mosquitoes within the 5 blocks.") +
+  guides(
+    fill = guide_legend(title = "Bins", order = 1, override.aes = list(shape = 21))#,
+  ) +
+  scale_color_manual(values = colorblind_palette) + # Use colorblind_palette
+  my_theme() +
+  theme(
+    plot.caption = element_text(face = "italic"),
+    legend.position = "right",
+    legend.justification = "top", # set the legend to the top
+    legend.box.just = "center",
+    legend.box.background = element_blank(), # remove the legend border
+    plot.margin = margin(5.5, 30, 5.5, 5.5, "points"), # increase right margin
+    legend.margin = margin(10,10,10,10) # move the legend a bit up
+  )
+
+#   ____________________________________________________________________________
+#   save the pca plot                                                       ####
+ggsave(
+  here(
+    "output", "gwas", "figures", "PCA_bins.pdf"
+  ),
+  width  = 10,
+  height = 6,
+  units  = "in"
+)
+```
+
+```{r}
+
+```
+
+
+### 3.12 Perform MDS analysis and create a covar.txt file
+
+```{bash}
+# Create .genome file
+plink \
+--keep-allele-order \
+--allow-extra-chr \
+--bfile output/gwas/file7 \
+--extract output/gwas/indepSNP_chr.prune.in \
+--genome \
+--out output/gwas/file8 \
+--silent;
+grep 'samples\|variants' output/gwas/file8.log
+```
+
+MDS with 10 vectors
+```{bash}
+# Make mds with 10 vectors
+plink \
+--keep-allele-order \
+--allow-extra-chr \
+--bfile output/gwas/file7 \
+--read-genome output/gwas/file8.genome \
+--cluster \
+--mds-plot 10 \
+--out output/gwas/file9_mds \
+--silent;
+grep 'samples\|variants' output/gwas/file9_mds.log
+```
+
+Create covar
+```{bash}
+# Change the format of the .mds file into a plink covariate file.
+awk '{print$1, $2, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13}' output/gwas/file9_mds.mds > output/gwas/covar_mds.txt;
+head output/gwas/covar_mds.txt
+```
+### 3.13 The phenotypes
+
+```{r}
+read_fam_file <-
+function(file_path) {
+  fam_data <- readr::read_delim(
+    file = file_path,
+    col_types = "ccccccc",
+    col_names = FALSE
+  )
+  return(fam_data)
+}
+```
+
+Import the data again
+
+```{r}
+fam2 <- read_fam_file(here(
+  "output", "gwas", "file7.fam"
+))
+
+# Rename columns
+fam2 <- fam2 |> 
+  rename(
+    FamilyID = X1,
+    IndividualID = X2,
+    PaternalID = X3,
+    MaternalID = X4,
+    Sex = X5,
+    Phenotype = X6
+  )
+
+# Make it numeric
+fam2$Phenotype <- as.numeric(fam2$Phenotype)
+
+head(fam2)
+```
+
+
+```{r}
+# Create bins
+breaks <- seq(0, 1, length.out = 5) # This creates a sequence from 0 to 1 with 5 breakpoints (i.e., 4 bins)
+
+# Create categories
+fam2$Phenotype_category <- cut(fam2$Phenotype, breaks = breaks, labels = FALSE, include.lowest = TRUE)
+
+head(fam2)
+```
+
+Count how many samples in each phenotype binn
+```{r}
+# Count the number of Phenotype values in each Phenotype_category
+fam2 |>
+  group_by(Phenotype_category) |>
+  summarise(count = n(), .groups = "drop")
+```
+
+How many samples per block
+```{r}
+# Count the number of Phenotype values in each FamilyID
+fam2 |>
+  group_by(FamilyID) |>
+  summarise(count = n(), .groups = "drop")
+```
+
+
+### 3.14 Histogram of phenotypes
+
+```{r}
+# Create a faceted histogram
+ggplot(fam2, aes(x = Phenotype)) +
+  geom_histogram(binwidth = 0.1, color = "black", fill = "lightpink") +  # Adjust binwidth as needed
+  facet_wrap(~ FamilyID) +  # Create a facet for each FamilyID
+  labs(x = "Phenotype", 
+       y = "Frequency", 
+       title = "Distribution of Phenotypes by Block") +
+  my_theme()
+
+# Save it
+ggsave(
+  here(
+    "output", "regenie", "figures", "histogram_phenotype_by_block.pdf"
+  ),
+  width  = 8,
+  height = 5,
+  units  = "in"
+)
+```
+
+
+## 4. Download Regenie
+
+https://github.com/rgcgithub/regenie/releases
+
+I downloaded version 3.6 and  put it on the directory regenie
+
+Unzip it
+```{bash, eval=FALSE}
+unzip output/regenie/regenie_v3.6.gz_x86_64_OSX
+```
+
+Change permissions
+```{bash, eval=FALSE}
+chmod 775 output/regenie/regenie_v3.4.gz_x86_64_OSX
+```
+
+Change permissions
+```{bash, eval=FALSE}
+chmod 775 output/regenie/regenie_v3.4.gz_x86_64_OSX
+```
+
+I decided to rename it
+```{bash, eval=FALSE}
+cp output/regenie/regenie_v3.4.gz_x86_64_OSX output/regenie/regenie
+```
+
+Create a symlink
+```{bash, eval=FALSE}
+sudo ln -s /Users/lucianocosme/Library/CloudStorage/Dropbox/GWAS/malathion/output/regenie/* /usr/local/bin/
+```
+
+Check the help
+```{bash, eval=FALSE}
+regenie --help
+```
+
+## 5. Filter the data to run Regenie
+
+We can use file1 from our GWAS with Plink to repeat the analysis with Regenie
+I copied the files to regenie directory and replaced the "_" with "." (covar, phenotypes, and the .fam files)
+```{bash}
+plink2 \
+--bfile output/gwas/file7 \
+--geno 0.1 \
+--maf 0.01 \
+--mind 0.1 \
+--mac 100 \
+--no-id-header \
+--out output/regenie/qc_pass \
+--write-samples \
+--write-snplist \
+--silent
+grep 'samples\|variants' output/regenie/qc_pass.log
+```
+
+## 6. Run Regenie
+
+Step 1 with Regenie
+```{bash}
+regenie \
+--step 1 \
+--bed output/gwas/file7 \
+--extract output/regenie/qc_pass.snplist \
+--keep output/regenie/qc_pass.id \
+--phenoFile output/regenie/phenotypes.txt \
+--covarFile output/gwas/covar_mds.txt \
+--qt \
+--bsize 1000 \
+--lowmem \
+--out output/regenie/Output_Step1
+```
+
+
+```{bash}
+plink2 \
+--bfile output/gwas/file7 \
+--export bgen-1.2 'bits=8' \
+--out output/regenie/file2
+```
+
+Step 2
+```{bash}
+regenie \
+--step 2 \
+--bgen output/regenie/file2.bgen \
+--sample output/regenie/file2.sample \
+--phenoFile output/regenie/phenotypes.txt \
+--covarFile output/gwas/covar_mds.txt \
+--qt \
+--extract output/regenie/qc_pass.snplist \
+--firth --approx --pThresh 0.01 \
+--pred output/regenie/Output_Step1_pred.list \
+--bsize 200 \
+--out output/regenie/Output_Step2
+
+```
+
+### 6.1. Manhattan plot
+Now import the data into R
+```{r}
+l <- fread(here("output", "regenie", "Output_Step2_Diapause.regenie"))
+l$P <-10^(-l$LOG10P) 
+head(l)
+```
+```{r}
+manhattan(
+  l,
+  snp = "ID",
+  bp = "GENPOS",
+  chr = "CHROM",
+  main = "with covar for stratification",
+  col = c("#42A7E1", "#B6419B", "#ECB766"),
+  annotatePval = TRUE,
+  annotateTop = TRUE,
+  highlight = l$ID[order(l$P)[1:10]]
+)
+```
+```{r}
+# Start the PDF device
+pdf(here("output", "regenie", "figures", "manhattan_plot_no_blocks.pdf"), width = 8, height = 5)
+
+# Create the Manhattan plot
+manhattan(
+  l,
+  snp = "ID",
+  bp = "GENPOS",
+  chr = "CHROM",
+  suggestiveline = -log10(1e-05),
+  main = "with covar for stratification",
+  col = c("#42A7E1", "#B6419B", "#ECB766"),
+  annotatePval = TRUE,
+  annotateTop = TRUE,
+  highlight = l$ID[order(l$P)[1:10]]
+)
+
+# Close the PDF device
+dev.off()
+```
+
+### 6.2 P-value distribution
+```{r}
+# source the plotting function
+source(
+  here(
+    "scripts", "analysis", "my_theme2.R"
+  )
+)
+
+ggplot(l, aes(x = P)) +
+  geom_histogram(binwidth = 0.05, color = "black", fill = "lightpink") + 
+  labs(x = "P-value", 
+       y = "Frequency", 
+       title = "Distribution of P-values") + my_theme() 
+
+# Save it
+ggsave(
+  here(
+    "output", "regenie", "figures", "p_value_dist_no_block.pdf"
+  ),
+  width  = 8,
+  height = 5,
+  units  = "in"
+)
+```
+### 6.3 Kolmogorov-Smirnov test (K-S test)
+```{r}
+# Generate some data
+set.seed(123)
+p_values <- l$P
+
+# Perform the K-S test
+ks_test_result <- ks.test(p_values, "punif", 0, 1)
+print(ks_test_result)
+```
+
+### 6.4 Empirical cumulative distribution function (ECDF)
+
+```{r}
+ggplot(l, aes(x = P)) +
+  stat_ecdf(geom = "step", color = "blue") +
+  stat_function(fun = punif, color = "red") +
+  labs(x = "P-value", 
+       y = "ECDF", 
+       title = "ECDF of P-values vs Uniform distribution") + my_theme()
+
+# Save it
+ggsave(
+  here(
+    "output", "regenie", "figures", "ECD_no_block.pdf"
+  ),
+  width  = 8,
+  height = 5,
+  units  = "in"
+)
+```
+
+### 6.5 Genomic inflation factor (lambda)
+```{r}
+observed_median <- median(l$CHISQ)
+
+# Expected median of a chi-squared distribution with one degree of freedom
+expected_median <- qchisq(0.5, df = 1)
+
+# Calculate genomic inflation factor
+lambda <- observed_median / expected_median
+print(lambda)
+```
+### 6.6 Using qqplotr library
+
+Prepare the data
+```{r}
+smp <-  data.frame(-log10(l$P))
+names(smp) = "P"
+di <- "exp" # exponential distribution
+dp <- list(rate = 2) # exponential rate parameter
+```
+
+Comparing the sample data to an exponential distribution with a rate parameter of 2.
+The exponential distribution is a probability distribution that describes the time between events in a Poisson point process, or a process in which events occur continuously and independently at a constant average rate. It has a single parameter, the rate (λ), which is the average rate of occurrence per unit of time or space
+
+```{r}
+smp <-  data.frame(-log10(l$P))
+names(smp) = "P"
+di <- "exp" # exponential distribution
+dp <- list(rate = 2) # exponential rate parameter
+
+gg <- ggplot(data = smp, mapping = aes(sample =  P)) +
+  geom_qq_band(
+    bandType = "pointwise",
+    mapping = aes(fill = "Normal"),
+    alpha = 0.35,
+    distribution = di,
+    dparams = dp
+  ) +
+  geom_qq_band(
+    bandType = "boot",
+    mapping = aes(fill = "Bootstrap"),
+    alpha = 0.35,
+    distribution = di,
+    dparams = dp
+  ) +
+  stat_qq_line(distribution = di, dparams = dp) +
+  stat_qq_point(distribution = di, dparams = dp) +
+  labs(
+    x = bquote('Theoretical Quantiles (' ~ -log[10] ~ ')'),
+    y = bquote('Sample Quantiles (' ~ -log[10] ~ ')')
+  ) +
+  scale_fill_discrete("Confidence Intervals: ") +
+  my_theme() +
+  theme(
+    legend.position = "top",
+    axis.text = element_text(size = 12, family = ""),
+    axis.title = element_text(size = 14),
+    panel.background = element_blank(),
+    axis.line = element_line()
+  )
+
+gg 
+
+# Save it
+ggsave(
+  here(
+    "output", "regenie", "figures", "qqplot_with_CI_no_block.pdf"
+  ),
+  width  = 8,
+  height = 5,
+  units  = "in"
+)
+```
+
+
+
+## 7. GWAS adding blocks to covar file
+
+```{r}
+# Load our data
+covar_mds <- read.table("output/gwas/covar_mds.txt", header=TRUE)
+
+# Map each unique block to a unique number
+block_mapping <- as.numeric(factor(covar_mds$FID))
+
+# Add this as a new column to our dataframe
+covar_mds$Block <- block_mapping
+
+# Write the updated data frame back to a text file
+write.table(covar_mds, file="output/gwas/covar_mds_updated.txt", sep="\t", row.names=FALSE, quote=FALSE)
+
+covar_mds
+```
+
+## 8. Run Regenie with block covar
+
+Step 1 with Regenie
+```{bash}
+regenie \
+--step 1 \
+--bed output/gwas/file7 \
+--extract output/regenie/qc_pass.snplist \
+--keep output/regenie/qc_pass.id \
+--phenoFile output/regenie/phenotypes.txt \
+--covarFile output/gwas/covar_mds_updated.txt \
+--qt \
+--bsize 1000 \
+--lowmem \
+--out output/regenie/Output_block_Step1
+```
+
+
+Step 2
+```{bash}
+regenie \
+--step 2 \
+--bgen output/regenie/file2.bgen \
+--sample output/regenie/file2.sample \
+--phenoFile output/regenie/phenotypes.txt \
+--covarFile output/gwas/covar_mds_updated.txt \
+--qt \
+--extract output/regenie/qc_pass.snplist \
+--firth --approx --pThresh 0.01 \
+--pred output/regenie/Output_block_Step1_pred.list \
+--bsize 200 \
+--out output/regenie/Output_Block_Step2
+
+```
+
+### 8.1. Manhattan plot
+Now import the data into R
+```{r}
+l <- fread(here("output", "regenie", "Output_Step2_Diapause.regenie"))
+l$P <-10^(-l$LOG10P) 
+head(l)
+```
+```{r}
+manhattan(
+  l,
+  snp = "ID",
+  bp = "GENPOS",
+  chr = "CHROM",
+  main = "with covar for stratification + blocks",
+  col = c("#42A7E1", "#B6419B", "#ECB766"),
+  annotatePval = TRUE,
+  annotateTop = TRUE,
+  highlight = l$ID[order(l$P)[1:5]]
+)
+```
+```{r}
+# Start the PDF device
+pdf(here("output", "regenie", "figures", "manhattan_plot_blocks.pdf"), width = 8, height = 5)
+
+# Create the Manhattan plot
+manhattan(
+  l,
+  snp = "ID",
+  bp = "GENPOS",
+  chr = "CHROM",
+  suggestiveline = -log10(1e-05),
+  main = "with covar for stratification + blocks",
+  col = c("#42A7E1", "#B6419B", "#ECB766"),
+  annotatePval = TRUE,
+  annotateTop = TRUE,
+  highlight = l$ID[order(l$P)[1:5]]
+)
+
+# Close the PDF device
+dev.off()
+```
+
+### 8.2 P-value distribution
+```{r}
+# source the plotting function
+source(
+  here(
+    "scripts", "analysis", "my_theme2.R"
+  )
+)
+
+ggplot(l, aes(x = P)) +
+  geom_histogram(binwidth = 0.05, color = "black", fill = "lightpink") + 
+  labs(x = "P-value", 
+       y = "Frequency", 
+       title = "Distribution of P-values") + my_theme() 
+
+# Save it
+ggsave(
+  here(
+    "output", "regenie", "figures", "p_value_dist_block.pdf"
+  ),
+  width  = 8,
+  height = 5,
+  units  = "in"
+)
+```
+### 8.3 Kolmogorov-Smirnov test (K-S test)
+```{r}
+# Generate some data
+set.seed(123)
+p_values <- l$P
+
+# Perform the K-S test
+ks_test_result <- ks.test(p_values, "punif", 0, 1)
+print(ks_test_result)
+```
+
+### 8.4 Empirical cumulative distribution function (ECDF)
+
+```{r}
+ggplot(l, aes(x = P)) +
+  stat_ecdf(geom = "step", color = "blue") +
+  stat_function(fun = punif, color = "red") +
+  labs(x = "P-value", 
+       y = "ECDF", 
+       title = "ECDF of P-values vs Uniform distribution") + my_theme()
+
+# Save it
+ggsave(
+  here(
+    "output", "regenie", "figures", "ECD_block.pdf"
+  ),
+  width  = 8,
+  height = 5,
+  units  = "in"
+)
+```
+
+### 8.5 Genomic inflation factor (lambda)
+```{r}
+observed_median <- median(l$CHISQ)
+
+# Expected median of a chi-squared distribution with one degree of freedom
+expected_median <- qchisq(0.5, df = 1)
+
+# Calculate genomic inflation factor
+lambda <- observed_median / expected_median
+print(lambda)
+```
+### 8.6 Using qqplotr library
+
+Prepare the data
+```{r}
+smp <-  data.frame(-log10(l$P))
+names(smp) = "P"
+di <- "exp" # exponential distribution
+dp <- list(rate = 2) # exponential rate parameter
+```
+
+Comparing the sample data to an exponential distribution with a rate parameter of 2.
+The exponential distribution is a probability distribution that describes the time between events in a Poisson point process, or a process in which events occur continuously and independently at a constant average rate. It has a single parameter, the rate (λ), which is the average rate of occurrence per unit of time or space
+
+```{r}
+smp <-  data.frame(-log10(l$P))
+names(smp) = "P"
+di <- "exp" # exponential distribution
+dp <- list(rate = 2) # exponential rate parameter
+
+gg <- ggplot(data = smp, mapping = aes(sample =  P)) +
+  geom_qq_band(
+    bandType = "pointwise",
+    mapping = aes(fill = "Normal"),
+    alpha = 0.35,
+    distribution = di,
+    dparams = dp
+  ) +
+  geom_qq_band(
+    bandType = "boot",
+    mapping = aes(fill = "Bootstrap"),
+    alpha = 0.35,
+    distribution = di,
+    dparams = dp
+  ) +
+  stat_qq_line(distribution = di, dparams = dp) +
+  stat_qq_point(distribution = di, dparams = dp) +
+  labs(
+    x = bquote('Theoretical Quantiles (' ~ -log[10] ~ ')'),
+    y = bquote('Sample Quantiles (' ~ -log[10] ~ ')')
+  ) +
+  scale_fill_discrete("Confidence Intervals: ") +
+  my_theme() +
+  theme(
+    legend.position = "top",
+    axis.text = element_text(size = 12, family = ""),
+    axis.title = element_text(size = 14),
+    panel.background = element_blank(),
+    axis.line = element_line()
+  )
+
+gg 
+
+# Save it
+ggsave(
+  here(
+    "output", "regenie", "figures", "qqplot_with_CI_block.pdf"
+  ),
+  width  = 8,
+  height = 5,
+  units  = "in"
+)
+```
+
+
+## 9. GWAS with Plink
+
+```{bash}
+plink \
+--allow-extra-chr \
+--bfile output/gwas/file7 \
+--covar output/gwas/covar_mds.txt \
+--linear hide-covar \
+--adjust \
+--out output/gwas/linear
+```
+
+Check results
+```{bash}
+head output/gwas/linear.assoc.linear.adjusted
+```
+
+### 9.1. Manhattan plot
+Now import the data into R
+```{r}
+l <- fread(here("output", "gwas", "linear.assoc.linear"))
+head(l)
+```
+```{r}
+manhattan(
+  l,
+  snp = "SNP",
+  bp = "BP",
+  chr = "CHR",
+  main = "with covar for stratification",
+  col = c("#42A7E1", "#B6419B", "#ECB766"),
+  annotatePval = TRUE,
+  annotateTop = TRUE,
+  highlight = l$ID[order(l$P)[1:10]]
+)
+```
+```{r}
+# Start the PDF device
+pdf(here("output", "regenie", "figures", "manhattan_plot_Plink_no_blocks.pdf"), width = 8, height = 5)
+
+# Create the Manhattan plot
+manhattan(
+  l,
+  snp = "SNP",
+  bp = "BP",
+  chr = "CHR",
+  suggestiveline = -log10(1e-05),
+  main = "with covar for stratification",
+  col = c("#42A7E1", "#B6419B", "#ECB766"),
+  annotatePval = TRUE,
+  annotateTop = TRUE,
+  highlight = l$ID[order(l$P)[1:10]]
+)
+
+# Close the PDF device
+dev.off()
+```
+
+### 9.2 P-value distribution
+```{r}
+# source the plotting function
+source(
+  here(
+    "scripts", "analysis", "my_theme2.R"
+  )
+)
+
+ggplot(l, aes(x = P)) +
+  geom_histogram(binwidth = 0.05, color = "black", fill = "lightpink") + 
+  labs(x = "P-value", 
+       y = "Frequency", 
+       title = "Distribution of P-values") + my_theme() 
+
+# Save it
+ggsave(
+  here(
+    "output", "regenie", "figures", "p_value_dist_plink_no_block.pdf"
+  ),
+  width  = 8,
+  height = 5,
+  units  = "in"
+)
+```
+### 9.3 Kolmogorov-Smirnov test (K-S test)
+```{r}
+# Generate some data
+set.seed(123)
+p_values <- l$P
+
+# Perform the K-S test
+ks_test_result <- ks.test(p_values, "punif", 0, 1)
+print(ks_test_result)
+```
+
+### 9.4 Empirical cumulative distribution function (ECDF)
+
+```{r}
+ggplot(l, aes(x = P)) +
+  stat_ecdf(geom = "step", color = "blue") +
+  stat_function(fun = punif, color = "red") +
+  labs(x = "P-value", 
+       y = "ECDF", 
+       title = "ECDF of P-values vs Uniform distribution") + my_theme()
+
+# Save it
+ggsave(
+  here(
+    "output", "regenie", "figures", "ECD_plink_no_block.pdf"
+  ),
+  width  = 8,
+  height = 5,
+  units  = "in"
+)
+```
+
+### 9.5 Genomic inflation factor (lambda)
+```{r}
+observed_median <- median(l$CHISQ)
+
+# Expected median of a chi-squared distribution with one degree of freedom
+expected_median <- qchisq(0.5, df = 1)
+
+# Calculate genomic inflation factor
+lambda <- observed_median / expected_median
+print(lambda)
+```
+### 9.6 Using qqplotr library
+
+Prepare the data
+```{r}
+smp <-  data.frame(-log10(l$P))
+names(smp) = "P"
+di <- "exp" # exponential distribution
+dp <- list(rate = 2) # exponential rate parameter
+```
+
+Comparing the sample data to an exponential distribution with a rate parameter of 2.
+The exponential distribution is a probability distribution that describes the time between events in a Poisson point process, or a process in which events occur continuously and independently at a constant average rate. It has a single parameter, the rate (λ), which is the average rate of occurrence per unit of time or space
+
+```{r}
+smp <-  data.frame(-log10(l$P))
+names(smp) = "P"
+di <- "exp" # exponential distribution
+dp <- list(rate = 2) # exponential rate parameter
+
+gg <- ggplot(data = smp, mapping = aes(sample =  P)) +
+  geom_qq_band(
+    bandType = "pointwise",
+    mapping = aes(fill = "Normal"),
+    alpha = 0.35,
+    distribution = di,
+    dparams = dp
+  ) +
+  geom_qq_band(
+    bandType = "boot",
+    mapping = aes(fill = "Bootstrap"),
+    alpha = 0.35,
+    distribution = di,
+    dparams = dp
+  ) +
+  stat_qq_line(distribution = di, dparams = dp) +
+  stat_qq_point(distribution = di, dparams = dp) +
+  labs(
+    x = bquote('Theoretical Quantiles (' ~ -log[10] ~ ')'),
+    y = bquote('Sample Quantiles (' ~ -log[10] ~ ')')
+  ) +
+  scale_fill_discrete("Confidence Intervals: ") +
+  my_theme() +
+  theme(
+    legend.position = "top",
+    axis.text = element_text(size = 12, family = ""),
+    axis.title = element_text(size = 14),
+    panel.background = element_blank(),
+    axis.line = element_line()
+  )
+
+gg 
+
+# Save it
+ggsave(
+  here(
+    "output", "regenie", "figures", "qqplot_with_CI_plink_no_block.pdf"
+  ),
+  width  = 8,
+  height = 5,
+  units  = "in"
+)
+```
+
+
+## 10. Get the SNP coordinates - Regenie
+
+We can import the file with the scaffold scale and find the SNP locations.
+
+Now import the data into R
+```{r}
+l <- fread(here("output", "regenie", "Output_Step2_Diapause.regenie"))
+
+l$P <-10^(-l$LOG10P) 
+head(l)
+```
+
+```{r}
+# Sort the data frame by P in ascending order
+sorted_l <- l[order(l$P), ]
+
+# Get the rows with the lowest P values
+# Replace 'n' with the number of rows you want to retrieve
+lowest_p_rows <- head(sorted_l, 5)
+
+# Print the result
+print(lowest_p_rows)
+```
+
+Now we can import the bim file with the scaffold coordinates
+```{r}
+# source function
+source(
+  here(
+    "scripts", "analysis", "import_bim.R")
+)
+```
+
+Import bim file
+```{r}
+file1 <- import_bim(here("output", "gwas", "file1.bim"))
+head(file1)
+```
+
+```{r}
+# Merge the two data frames by the specified columns
+merged_data <- merge(lowest_p_rows, file1, by.x = "ID", by.y = "SNP")
+
+# View the merged data frame
+head(merged_data)
+```
+Select only a few columns
+```{r}
+snps_loc <- merged_data |>
+  dplyr::select(ID, CHROM, GENPOS, Scaffold, Position, ALLELE0, ALLELE1, A1FREQ, CHISQ, LOG10P, P)
+
+head(snps_loc)
+```
+
+
+## 11. Get gene information from gff file
+
+Since we created a chromosomal scale and the gff file has the scaffolds positions, we can get the genomic coordinates of the genes and then lift them to the chromosomal scale. Another way would be get the SNPs IDs and check where they are located. Each way has its up and down sides.
+
+The gff file with the annotation for the AalbF3 genome assembly is available in the project, under the files directory.
+
+```{bash}
+head data/files/genes.gff
+```
+
+To start we can get the scaffold, start and end of each gene. I will do this because I might need to represent the genes in a plot using ggplot.
+
+```{bash}
+# In the code below we get the gene id, the scaffold id, the gene start, the gene end, and the size of the genomic regions the gene covers (end - start)
+awk 'BEGIN {OFS="\t"} $3=="gene" {split($9, a, ";"); split(a[1], b, "="); size = $5 - $4; print b[2], $1, $4, $5, size}' data/files/genes.gff | head
+```
+
+
+Create a file with the genomic coordinates for each gene
+```{bash}
+# In the code below we get the gene id, the scaffold id, the gene start, the gene end, and the size of the genomic regions the gene covers (end - start)
+awk 'BEGIN {OFS="\t"} $3=="gene" {split($9, a, ";"); split(a[1], b, "="); size = $5 - $4; print b[2], $1, $4, $5, size}' data/files/genes.gff > data/files/genes.txt;
+wc -l data/files/genes.txt
+```
+
+We got 20,621 genes in the gff file.
+
+We can import the data into R now
+```{r}
+gene_data <- read_delim(here("data", "files","genes.txt"), delim = "\t", col_names = c("Gene_ID", "Scaffold", "Start", "End", "Size"), show_col_types = FALSE)
+head(gene_data)
+```
+
+First we need to remove the string "chr" from the collumn Scaffold.
+
+```{r}
+gene_data <- gene_data %>%
+  mutate(Scaffold = str_remove(Scaffold, "chr"))
+head(gene_data)
+```
+
+Now we can find in which genes we have the top 10 SNPs using library fuzzyjoin
+
+```{r}
+# Convert Scaffold columns to character type if they are not already
+snps_loc$Scaffold <- as.character(snps_loc$Scaffold)
+gene_data$Scaffold <- as.character(gene_data$Scaffold)
+
+# Perform the join
+snps_on_genes <- fuzzyjoin::genome_join(
+  snps_loc,
+  gene_data,
+  by = c("Scaffold", "Position" = "Start", "Position" = "End"),
+  mode = "inner"
+)
+
+# View the results
+snps_on_genes
+```
+Remove string "Gene-" from column Gene_ID
+```{r}
+# Replace 'gene-' with an empty string in the Gene_ID column
+snps_on_genes$Gene_ID <- gsub("gene-", "", snps_on_genes$Gene_ID)
+
+# View the modified Gene_ID column
+head(snps_on_genes$Gene_ID)
+head(snps_on_genes$ID)
+```
+```
+[1] "LOC109398973" "LOC109397812" "LOC109405365" "LOC109397825" "LOC109405370"
+[1] "AX-583243819" "AX-583876354" "AX-583876354" "AX-583878382" "AX-583879260"
+```
+```{r}
+snps_on_genes$Position
+```
+
+
+Save as Excel file
+```{r}
+# Save the data frame as an Excel file
+write.xlsx(snps_loc, here("output", "regenie", "top_5_SNPs_regenie.xlsx"))
+```
+
+
+Save it
+```{r}
+saveRDS(snps_on_genes, file = here("output", "regenie", "snps_genes_chr.rds"))
+```
+
+## 12. Estimate genotype frequencies
+
+We can use the data we prepared ealier
+```{r}
+# Print the result
+print(lowest_p_rows)
+```
+Estimate the genotype frequencies under HWE
+```{r}
+# Calculate the frequency of allele 0
+lowest_p_rows$A0FREQ <- 1 - lowest_p_rows$A1FREQ
+
+# Calculate the expected genotype frequencies
+lowest_p_rows$Freq_A1A1 <- lowest_p_rows$A1FREQ^2
+lowest_p_rows$Freq_A1A0 <- 2 * lowest_p_rows$A1FREQ * lowest_p_rows$A0FREQ
+lowest_p_rows$Freq_A0A0 <- lowest_p_rows$A0FREQ^2
+
+# View the updated data frame
+head(lowest_p_rows)
+```
+Create columns with the genotypes
+```{r}
+# Create columns for each genotype
+lowest_p_rows$g_HOM_A1 <- paste(lowest_p_rows$ALLELE1, lowest_p_rows$ALLELE1, sep="")
+lowest_p_rows$g_HET <- paste(lowest_p_rows$ALLELE0, lowest_p_rows$ALLELE1, sep="")
+lowest_p_rows$g_HOM_A0 <- paste(lowest_p_rows$ALLELE0, lowest_p_rows$ALLELE0, sep="")
+
+# View the updated data frame
+head(lowest_p_rows)
+```
+
+Create the genotype frequency plot for the entire data set
+
+```{r, fig.height=4, fig.width=6}
+# load plotting theme
+source(
+  here(
+    "scripts", "analysis", "my_theme2.R"
+  )
+)
+# Reshape the data to long format
+long_data <- lowest_p_rows %>%
+  gather(key = "Genotype",
+         value = "Frequency",
+         Freq_A1A1,
+         Freq_A1A0,
+         Freq_A0A0)
+
+# Make it long format
+long_data$Genotype_label <-
+  ifelse(
+    long_data$Genotype == "Freq_A1A1",
+    lowest_p_rows$g_HOM_A1,
+    ifelse(
+      long_data$Genotype == "Freq_A1A0",
+      lowest_p_rows$g_HET,
+      lowest_p_rows$g_HOM_A0
+    )
+  )
+
+# Create column to categorize genotypes
+long_data$Zygosity <-
+  ifelse(
+    long_data$Genotype_label == long_data$g_HOM_A1,
+    "HOMA1",
+    ifelse(long_data$Genotype_label == long_data$g_HOM_A0, "HOMA0", "HET")
+  )
+
+# Set the factor levels for Zygosity to control the order of the bars
+long_data$Zygosity <-
+  factor(long_data$Zygosity, levels = c("HOMA1", "HET", "HOMA0"))
+
+# Plot it
+ggplot(long_data, aes(x = Genotype_label, y = Frequency, fill = Zygosity)) +
+  geom_bar(stat = "identity",
+           position = position_dodge(),
+           color = "black") +
+  scale_fill_manual(values = c(
+    "HOMA1" = "gray",
+    "HET" = "magenta",
+    "HOMA0" = "orange"
+  )) +
+  facet_wrap( ~ ID, scales = "free_x", ncol = 5) +
+  geom_text(
+    aes(label = sprintf("%.2f", Frequency), group = Zygosity),
+    vjust = -0.5,
+    position = position_dodge(width = 0.9),
+    size = 3
+  ) +
+  labs(x = "Zygosity", y = "Frequency", title = "") + my_theme() +
+  theme(legend.position = "none",
+        strip.text = element_text(margin = margin(t = 5, b = 5))) +
+  ylim(0, 1)
+
+ggsave(
+  here(
+    "output", "regenie", "figures" , "top_5_frequencies.pdf"
+  ),
+  width              = 6,
+  height             = 4,
+  units              = "in"
+)
+```
+
+## 13. Genotype frequencies histograms
+
+```{r}
+fam1 <-
+  read.delim(
+    file   = here(
+      "output", "gwas", "file7.fam"
+    ),
+    header = FALSE,
+    
+  )
+head(fam1)
+```
+To create a histogram we need to define bins
+```{r}
+# Define the breaks for binning (10 bins with the specified labels)
+breaks <- seq(0, 1, by = 0.1)  # Define the breakpoints
+
+# Create labels for the bins based on the breaks
+labels <- paste0(head(breaks, -1), "-", tail(breaks, -1))
+
+# Bin the V6 column into 10 bins with the specified labels
+fam1$V6_bins <- cut(fam1$V6, breaks = breaks, labels = labels, include.lowest = TRUE)
+
+# Check the result
+head(fam1)
+
+```
+
+I created a directory called frequencies and put file7 there
+```{r}
+fam2 <- fam1 |>
+  dplyr::select(V6_bins, V2, V3, V4, V5, V6)
+
+#   ____________________________________________________________________________
+#   save calculation to load later                                          ####
+write.table(
+  fam2,
+  file      = here(
+    "output", "frequencies", "file7.fam"
+  ),
+  sep       = "\t",
+  row.names = FALSE,
+  col.names = FALSE,
+  quote     = FALSE
+)
+```
+
+Check it out
+```{bash}
+head output/frequencies/file7.fam
+```
+
+Now we can estimate the frequencies for each family, which are our bins
+
+
+```{bash}
+for fam in $(awk '{print $1}' output/frequencies/file7.fam | sort | uniq); 
+do 
+echo $fam | \
+plink2 \
+--extract output/frequencies/top_5_snps.txt \
+--bfile output/frequencies/file7 \
+--keep-fam /dev/stdin \
+--out output/frequencies/$fam \
+--geno-counts \
+--silent
+done
+```
+
+
+Before run the code below, remember to delete the ID.txt in the directory otherwise it will give you a error
+
+Get genotype frequencies
+```{bash}
+# Create a directory for the SNP genotype files if it doesn't exist
+mkdir -p output/frequencies/genotype_files
+
+# Create a list of unique SNPs
+unique_snps=$(awk 'NR>1 {print $2}' output/frequencies/*.gcount | sort | uniq)
+
+# For each unique SNP
+for snp in $unique_snps; do
+    # Create an empty temporary file
+    > output/frequencies/genotype_files/${snp}_tmp.txt
+  
+    # Loop through each family's genotype count file
+    for file in output/frequencies/*.gcount; do
+        family=$(basename $file .gcount)  # Extract the family name from the filename
+        
+        # Extract alleles for the SNP from the current family file
+        ref_allele=$(awk -v snp="$snp" 'NR>1 && $2 == snp {print $3}' $file | head -n 1)
+        alt_allele=$(awk -v snp="$snp" 'NR>1 && $2 == snp {print $4}' $file | head -n 1)
+        genotypes="${ref_allele}${ref_allele}\t${ref_allele}${alt_allele}\t${alt_allele}${alt_allele}"
+
+        # Extract genotype frequencies for the SNP from the current family file and append to the SNP's file
+        awk -v snp="$snp" -v family="$family" 'NR>1 && $2 == snp {
+            total_count = $5 + $6 + $7
+            ref_ref_freq = $5 / total_count
+            ref_alt_freq = $6 / total_count
+            alt_alt_freq = $7 / total_count
+            print $2 "\t" family "\t" ref_ref_freq "\t" ref_alt_freq "\t" alt_alt_freq
+        }' $file >> output/frequencies/genotype_files/${snp}_tmp.txt
+
+        # If the SNP genotype file does not exist yet, create it with a header using the appropriate alleles
+        if [[ ! -f output/frequencies/genotype_files/${snp}.txt ]]; then
+            echo -e "SNP\tStratum\t$genotypes" > output/frequencies/genotype_files/${snp}.txt
+        fi
+    done
+
+    # Append the extracted data to the SNP genotype file
+    cat output/frequencies/genotype_files/${snp}_tmp.txt >> output/frequencies/genotype_files/${snp}.txt
+    rm output/frequencies/genotype_files/${snp}_tmp.txt
+done
+```
+
+Remove the id file
+```{bash}
+rm output/frequencies/genotype_files/ID.txt
+```
+
+
+Now we can prepare the data for plotting
+```{r}
+files <- list.files(path = here("output", "frequencies", "genotype_files"), pattern = "*.txt", full.names = TRUE)
+
+all_data <- lapply(files, function(file) {
+  dat <- read.table(
+    file,
+    header = TRUE,
+    sep = "\t",
+    stringsAsFactors = FALSE,
+    colClasses = c("character")
+  )
+  
+  # Storing genotype names from columns 3 to 5
+  genotype_names <- colnames(dat)[3:5]
+  
+  # Renaming columns 3 to 5
+  colnames(dat)[3:5] <- c("Genotype1_Value", "Genotype2_Value", "Genotype3_Value")
+  
+  # Add the genotype names as new columns
+  dat$Genotype1_Name <- genotype_names[1]
+  dat$Genotype2_Name <- genotype_names[2]
+  dat$Genotype3_Name <- genotype_names[3]
+  
+  # Add SNP column
+  dat$SNP <- gsub(".txt", "", basename(file))
+  
+  return(dat)
+})
+
+# Binding all data frames
+all_data_df <- do.call(rbind, all_data)
+```
+
+
+Find all genotypes
+```{r}
+# Combine all genotype name columns into one vector and find unique values
+unique_genotypes <- unique(c(all_data_df$Genotype1_Name, all_data_df$Genotype2_Name, all_data_df$Genotype3_Name))
+
+# Print the unique genotypes
+print(unique_genotypes)
+```
+
+
+
+Set the colors 
+```{r}
+# Generate a palette with viridis
+genotype_palette <- viridis::viridis(16)
+
+# First get the maximum from one palette
+palette1 <- brewer.pal(11, "Spectral")
+# Then get the rest from another palette, making sure to not have duplicates
+palette2 <- brewer.pal(5, "Set3")
+
+# Combine them while excluding any duplicates
+genotype_colors <- unique(c(palette1, palette2))
+
+# Ensure that there are 16 unique colors
+genotype_colors <- genotype_colors[1:16]
+```
+
+
+Make it long format
+```{r}
+# Reshape the data to long format for plotting genotypes
+geno_long <- all_data_df %>%
+  mutate(
+    Genotype1_Name = as.character(Genotype1_Name),
+    Genotype2_Name = as.character(Genotype2_Name),
+    Genotype3_Name = as.character(Genotype3_Name)
+  ) %>%
+  pivot_longer(
+    cols = c(Genotype1_Value, Genotype2_Value, Genotype3_Value),
+    names_to = "Genotype_Num",
+    values_to = "Value"
+  ) %>%
+  mutate(
+    Genotype = case_when(
+      Genotype_Num == "Genotype1_Value" ~ Genotype1_Name,
+      Genotype_Num == "Genotype2_Value" ~ Genotype2_Name,
+      Genotype_Num == "Genotype3_Value" ~ Genotype3_Name
+    ),
+    Value = as.numeric(Value)  # Ensure that Value is numeric
+  )
+```
+
+
+
+```{r, fig.height=10, fig.width=12}
+# load plotting theme
+source(
+  here(
+    "scripts", "analysis", "my_theme2.R"
+  )
+)
+
+# Update the plot with genotypes
+plot <- ggplot(geno_long, aes(x = Stratum, y = Value, fill = Genotype, group = Genotype)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.9), aes(color = Stratum), linewidth = 0.5) +
+  scale_fill_manual(name = "Genotype", values = genotype_colors) +
+  # scale_color_manual(name = "", values = stratum_border_colors) +
+  scale_y_continuous(limits = c(0, 1.2), breaks = seq(0, 1, by = 0.25)) +
+  facet_wrap(~ SNP, scales = "free_x", ncol = 1) +
+  geom_text(
+    aes(label = Genotype, y = Value + 0.02, group = Genotype),
+    position = position_dodge(width = 0.9),
+    vjust = -0.25,
+    size = 2.5,
+    check_overlap = TRUE
+  ) +
+  labs(x = "Diapause Incidence", y = "Frequency") +
+  my_theme() +
+  theme(
+    strip.text.x = element_text(size = 10, face = "bold", margin = margin(t = 1, b = 1, unit = "pt")),
+    legend.position = "top",
+    legend.title.align = 0.5, 
+    strip.background = element_rect(fill = "#e8e8e8", colour = NA),
+    panel.spacing = unit(1, "lines"),
+    axis.text.x = element_text(color = "black"),
+    axis.text.y = element_text(color = "black")
+  ) +
+  guides(
+    fill = guide_legend(nrow = 1, byrow = TRUE, title = "Genotypes"),
+    color = "none"
+  ) 
+# Add ggtext compatible theme settings for using HTML in axis.text.x
+plot <- plot + theme(axis.text.x = element_markdown())
+
+# Output the plot
+print(plot)
+
+# # Save it
+output_path <- here("output", "frequencies", "figures", "top_5_snps_genotypes.pdf")
+ggsave(output_path, plot, height = 10, width = 12, dpi = 300)
+```
+
+## 14. Estimate allele frequencies
+
+```{bash}
+for fam in $(awk '{print $1}' output/frequencies/file7.fam | sort | uniq); 
+do 
+echo $fam | \
+plink2 \
+--extract output/frequencies/top_5_snps.txt \
+--bfile output/frequencies/file7 \
+--keep-fam /dev/stdin \
+--out output/frequencies/$fam \
+--freq \
+--silent
+done
+```
+
+Estimate the frequencies
+```{bash}
+# Create a directory for the SNP files if it doesn't exist
+mkdir -p output/frequencies/snp_files
+
+# Create a list of unique SNPs
+unique_snps=$(awk 'NR>1 {print $2}' output/frequencies/*.afreq | sort | uniq)
+
+# For each unique SNP
+for snp in $unique_snps; do
+    # Create an empty temporary file
+    > output/frequencies/snp_files/${snp}_tmp.txt
+  
+    # Loop through each family's frequency file
+    for file in output/frequencies/*.afreq; do
+        family=$(basename $file .afreq)  # Extract the family name from the filename
+        
+        # Extract the frequency for the SNP from the current family file and append to the SNP's file
+        awk -v snp="$snp" -v family="$family" 'NR>1 && $2 == snp {print $2 "\t" family "\t" (1-$5) "\t" $5}' $file >> output/frequencies/snp_files/${snp}_tmp.txt
+        
+        # If the SNP file does not exist yet, create it with a header using the appropriate alleles
+        if [[ ! -f output/frequencies/snp_files/${snp}.txt ]]; then
+            alleles=$(awk -v snp="$snp" 'NR>1 && $2 == snp {print $3 "\t" $4}' $file | head -n 1)
+            echo -e "SNP\tStratum\t$alleles" > output/frequencies/snp_files/${snp}.txt
+        fi
+    done
+  
+    # Append the extracted data to the SNP file
+    cat output/frequencies/snp_files/${snp}_tmp.txt >> output/frequencies/snp_files/${snp}.txt
+    rm output/frequencies/snp_files/${snp}_tmp.txt
+  
+done
+```
+
+Remove the id file
+```{bash}
+rm output/frequencies/snp_files/ID.txt
+```
+
+Prepare the data
+```{r}
+files <- list.files(path = here("output", "frequencies", "snp_files"), pattern = "*.txt", full.names = TRUE)
+
+all_data <- lapply(files, function(file) {
+  dat <- read.table(
+    file,
+    header = TRUE,
+    sep = "\t",
+    stringsAsFactors = FALSE,
+    colClasses = c("character")
+  )
+  
+  # Storing allele names from columns 3 and 4
+  allele_names <- colnames(dat)[3:4]
+  
+  # Renaming columns 3 and 4
+  colnames(dat)[3:4] <- c("Allele1_Value", "Allele2_Value")
+  
+  # Add the allele names as new columns
+  dat$Allele1_Name <- allele_names[1]
+  dat$Allele2_Name <- allele_names[2]
+  
+  # Add SNP column
+  dat$SNP <- gsub(".txt", "", basename(file))
+  
+  return(dat)
+})
+
+# Binding all data frames
+all_data_df <- do.call(rbind, all_data)
+```
+
+
+
+Create a plot
+
+Option 1 - color borders
+```{r, fig.height=6, fig.width=12}
+# Reshape the data while keeping the original allele names
+all_data_long4 <- all_data_df %>%
+  pivot_longer(
+    cols = c(Allele1_Value, Allele2_Value),
+    names_to = "Allele",
+    values_to = "Value",
+    names_pattern = "Allele(\\d)_Value"
+  ) %>%
+  mutate(
+    Allele = if_else(Allele == "1", Allele1_Name, Allele2_Name),
+    Value = as.numeric(Value)  # Convert Value to numeric
+  )
+
+# load plotting theme
+source(
+  here(
+    "scripts", "analysis", "my_theme2.R"
+  )
+)
+
+# # Define the colors for the borders corresponding to each Stratum
+# stratum_border_colors <- c("AUT" = "red", "MAN" = "black", "NEW" = "black")
+# 
+# # Create a named vector of colors for the axis text
+# axis_text_colors <- c("AUT" = "red", "MAN" = "black", "NEW" = "black")
+# 
+
+# Define the colors for the alleles
+allele_colors <- c("A" = "#ffccd1", "T" = "#e3fcc2", "C" = "#ffec8f", "G" = "#bdbdfa")
+
+# Define the colors for the borders corresponding to each Stratum
+# stratum_border_colors <- c("AUT" = "red", "MAN" = "black", "NEW" = "black")
+
+# Recreate the plot with custom border colors for each Stratum and specific colors for alleles
+plot <- ggplot(all_data_long4, aes(x = Stratum, y = Value, fill = Allele, group = Allele)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.9),
+           aes(color = Stratum), linewidth = .5) +
+  scale_fill_manual(name = "", values = allele_colors) +
+  # scale_color_manual(name = "", values = stratum_border_colors) +
+  facet_wrap(~ SNP, scales = "free_x", ncol = 1) +
+  geom_text(
+    aes(label = Allele, y = Value + 0.02, group = Allele),
+    position = position_dodge(width = 0.6),
+    vjust = -0.25,
+    size = 3,
+    check_overlap = TRUE
+  ) +
+  scale_y_continuous(limits = c(0, 1.2), breaks = seq(0, 1, by = 0.25)) +
+  labs(x = "Diapause Incidence", y = "Frequency") +
+  my_theme() +
+  theme(
+    strip.text.x = element_text(size = 8, face = "bold", margin = margin(t = 1, b = 1, unit = "pt")),
+    legend.position = "top",
+    strip.background = element_rect(fill = "#e8e8e8", colour = NA),
+    panel.spacing = unit(1, "lines"),
+    axis.text.x = element_text(color = "black"),
+    axis.text.y = element_text(color = "black")
+  ) +
+  guides(
+    fill = guide_legend(order = 1), 
+    color = "none"
+    # color = guide_legend(order = 2, override.aes = list(fill = NA))
+  )# + 
+  # scale_x_discrete(labels = function(x) ifelse(x %in% names(axis_text_colors), paste0("<span style='color:", axis_text_colors[x], ";'>", x, "</span>"), x))
+
+plot <- plot + theme(axis.text.x = element_markdown())
+# Output the plot
+print(plot)
+
+# # Save it
+output_path <- here("output", "frequencies", "figures", "top5_snps_alleles.pdf")
+ggsave(output_path, plot, height = 6, width = 12, dpi = 300)
+```
+
+
+
+## 15. SNP functional annotation
+
+```{bash, eval=FALSE, cache=TRUE, message=FALSE, results='hide'}
+# then annotate the vcf with the v4
+java -Xmx8g -jar /Users/lucianocosme/Packages/snpEff/snpEff.jar albo_v3 data/gwas/gwas_dp_july_23_2023.vcf -v > output/gwas/diapause.vcf
+```
+
+
+Now we can grep the SNPs and find out what genes are nearby
+```{bash}
+grep -f output/frequencies/top_5_snps.txt output/gwas/diapause.vcf > output/gwas/genes_top_SNPs.txt;
+head -n1 output/gwas/genes_top_SNPs.txt
+```
+
+Now we have to get the genes near each SNP.
+
+```{bash}
+sed -e 's/|/\t/g' -e 's/,/\t/g' -e 's/;/\t/g' -e 's/\t\+/\t/g' output/gwas/genes_top_SNPs.txt | awk -F"\t" '{
+    for(i = 1; i <= NF; ++i) {
+        if ($i == "GT") {
+            break
+        } else {
+            if ($i !~ /\//) {
+                printf "%s\t", $i
+            }
+        }
+    }
+    printf "\n"
+}' > output/gwas/snps_diapause.txt
+```
+
+
+```{bash}
+sed -e 's/|/\t/g' -e 's/,/\t/g' -e 's/;/\t/g' -e 's/\t\+/\t/g' output/gwas/genes_top_SNPs.txt | awk -F"\t" '{
+    for(i = 1; i <= NF; ++i) {
+        if ($i == "GT") {
+            break
+        } else {
+            if ($i !~ /\//) {
+                printf "%s\t", $i
+            }
+        }
+    }
+    printf "\n"
+}' | awk -F '\t' '{print $1, $2, $3, $10, $11, $12, $13, $17, $18, $19, $20}' > output/gwas/snps_diapause.txt;
+head output/gwas/snps_diapause.txt
+```
+```
+1.131 2393813 AX-583243819 ANN=A synonymous_variant LOW exon-XM_029876692.1-1 protein_coding c.2757G>A p.Pro919Pro 
+1.134 1359404 AX-583290943 ANN=G intergenic_region MODIFIER exon-XM_020077118.2-1-exon-XM_020077119.2-1   n.1359404A>G 
+1.7 2238315 AX-583876354 ANN=A synonymous_variant LOW exon-XM_019678420.2-1 protein_coding c.1986G>A p.Ser662Ser 
+1.7 2580810 AX-583878382 ANN=T 5_prime_UTR_variant MODIFIER exon-XM_019670155.2-1 protein_coding c.-181G>A  
+1.7 3039560 AX-583879260 ANN=T intron_variant MODIFIER exon-XM_029853706.1-1 protein_coding c.445+3704C>T 
+```
+
+```{bash}
+grep "exon-XM_019678420.2-1" output/gwas/diapause.vcf
+```
+
+
+## 16. GWAS using binary trait
+
+Instead of using the entire data set, we can select those females that did not laid any diapausing eggs and those with let's say more than 80% of the eggs as diapausing eggs.
+
+```{r}
+# we will keep the order of the rows in this file
+fam1 <-
+  read.delim(
+    file   = here(
+      "output", "gwas", "file7.fam"
+    ),
+    header = FALSE,
+    
+  )
+head(fam1)
+```
+
+Now we can select those with diapause incidence 0 or above 0.6
+
+Females with no diapausing eggs
+```{r}
+# Filter rows where V6 equals 0
+no_diapause <- fam1[fam1$V6 == 0, ]
+
+# To view the filtered data
+nrow(no_diapause)
+```
+
+Females with more than 80% eggs undergoing diapause
+```{r}
+# Filter rows where V6 equals 0
+with_diapause <- fam1[fam1$V6 >= 0.6, ]
+
+# To view the filtered data
+nrow(with_diapause)
+```
+
+Not too many samples, but we can run the analysis and see how it goes.
+
+Save the list of samples to disk
+```{r}
+write.table(
+  no_diapause |>
+    dplyr::select(V1, V2),
+  file      = here(
+    "output", "gwas", "no_diapause_samples.txt"
+  ),
+  sep       = "\t",
+  row.names = FALSE,
+  col.names = FALSE,
+  quote     = FALSE
+)
+
+write.table(
+  with_diapause |>
+    dplyr::select(V1, V2),
+  file      = here(
+    "output", "gwas", "diapause_samples.txt"
+  ),
+  sep       = "\t",
+  row.names = FALSE,
+  col.names = FALSE,
+  quote     = FALSE
+)
+```
+
+Check it out
+```{bash}
+wc -l output/gwas/no_diapause_samples.txt;
+wc -l output/gwas/diapause_samples.txt;
+cat output/gwas/no_diapause_samples.txt output/gwas/diapause_samples.txt > output/gwas/diapause_binary.txt;
+wc -l  output/gwas/diapause_binary.txt;
+head output/gwas/diapause_binary.txt
+```
+
+## 17. GWAS with binary traits
+
+We have both males and females in our data set. Besides we have mosquitoes that we do not know their sex. So, we can filter them out and only keep the females.
+
+Let's check the fam file
+```{bash}
+head output/gwas/file7.fam
+```
+
+We can subset with Plink now
+
+```{bash}
+plink \
+--keep-allele-order \
+--allow-extra-chr \
+--allow-no-sex \
+--make-bed \
+--bfile output/gwas/file7 \
+--keep output/gwas/diapause_binary.txt \
+--out output/gwas/file71 \
+--silent;
+grep 'samples\|variants' output/gwas/file71.log
+```
+
+### 7.1 Quick PCA with Plink using the LD pruned data
+
+```{bash}
+plink2 \
+--allow-extra-chr \
+--bfile output/gwas/file71 \
+--pca allele-wts \
+--freq \
+--out output/gwas/pca_gwas_binary \
+--silent;
+grep 'samples\|variants' output/gwas/pca_gwas_binary.log
+```
+
+Check the files
+```{bash}
+head -n 2 output/gwas/pca_gwas_binary.eigenvec
+```
+
+```{bash}
+head -n 2 output/gwas/pca_gwas_binary.eigenval
+```
+
+Import PCA data
+```{r}
+# import the data from Plink
+pca <- read.delim(
+  here(
+    "output", "gwas", "pca_gwas_binary.eigenvec"
+  ),
+  head = TRUE
+)
+ 
+# check head of the file
+head(pca)
+```
+
+```{r}
+# import the data from Plink
+fam_pca <- read.delim(
+  here(
+    "output", "gwas", "file71.fam"
+  ),
+  head = FALSE, sep = " "
+)
+ 
+# To see the changes
+head(fam_pca)
+```
+
+
+
+Check number of samples per population
+```{r}
+blocks_pca <- 
+  pca |>
+  group_by(X.FID) |>
+  summarize(count_distinct = n_distinct(IID))
+
+# check it
+head(blocks_pca)
+```
+Now we can update the phenotype
+
+```{r}
+# Update V6 based on the condition
+fam_pca$V6 <- ifelse(fam_pca$V6 == 0, 1, 2)
+
+# To view the updated data
+head(fam_pca)
+```
+
+
+Make plot1
+```{r, fig.height=8, fig.width=10}
+# source the plotting function
+source(
+  here(
+    "scripts", "analysis", "my_theme2.R"
+  )
+)
+
+colorblind_palette <-
+  c(
+    "#E69F00",
+    "#56B4E9",
+    "#009E73",
+    "#F0E442",
+    "#0072B2",
+    "#D55E00",
+    "#CC79A7",
+    "#800000",
+    "#808080",
+    "#CCEBC5",
+    "#FFB5B8",
+    "#99CCFF",
+    "#8E8BFF"
+  )
+
+# make plot by continent and range
+ggplot(pca, aes(PC1, PC2)) +
+  geom_point(aes(fill = X.FID), shape = 21) +
+  xlab("PC1 (10.81% Variance)") +
+  ylab("PC2 (10.32% Variance)") +
+  labs(
+    caption = "Principal Component Analysis with 34,083 SNPs from 225 females.") +
+  guides(
+    fill = guide_legend(title = "Populations", order = 1, override.aes = list(shape = 21))#,
+  ) +
+  scale_color_manual(values = colorblind_palette) + # Use colorblind_palette
+  my_theme() +
+  theme(
+    plot.caption = element_text(face = "italic"),
+    legend.position = "right",
+    legend.justification = "top", # set the legend to the top
+    legend.box.just = "center",
+    legend.box.background = element_blank(), # remove the legend border
+    plot.margin = margin(5.5, 30, 5.5, 5.5, "points"), # increase right margin
+    legend.margin = margin(10,10,10,10) # move the legend a bit up
+  )
+
+
+#   ____________________________________________________________________________
+#   save the pca plot                                                       ####
+ggsave(
+  here(
+    "output", "gwas", "figures", "pca_gwas_binary.pdf"
+  ),
+  width  = 10,
+  height = 6,
+  units  = "in"
+)
+```
+Merge objects
+```{r}
+# Merge fam_pca and pca dataframes
+merged_data <- merge(fam_pca, pca, by.x = "V2", by.y = "IID")
+
+# To see the merged dataframe
+head(merged_data)
+```
+
+Plot it
+```{r, fig.height=8, fig.width=10}
+# Convert V6 to a factor and explicitly specify the levels and labels
+merged_data$V6_factor <- factor(merged_data$V6, levels = c(1, 2), labels = c("Tropical", "Temperate"))
+
+# Define a color palette
+colors <- c("Tropical" = "red", "Temperate" = "blue")
+
+# Make the plot by continent and range
+ggplot(merged_data, aes(x = PC1, y = PC2, fill = V6_factor)) +
+  geom_point(shape = 21, size = 3, stroke = 0.5) +  # Set the shape and size of points
+  scale_fill_manual(values = colors, name = "Region") +
+  labs(
+    x = "PC1 (10.81% Variance)",
+    y = "PC2 (10.32% Variance)",
+    caption = "Principal Component Analysis with 34,083 SNPs from 225 females."
+  ) +
+  my_theme() +
+  theme(
+    plot.caption = element_text(face = "italic"),
+    legend.position = "right",
+    legend.justification = "top", # set the legend to the top
+    legend.box.just = "center",
+    legend.box.background = element_blank(), # remove the legend border
+    plot.margin = margin(5.5, 30, 5.5, 5.5, "points"), # increase right margin
+    legend.margin = margin(10, 10, 10, 10) # move the legend a bit up
+  )
+
+
+  # ____________________________________________________________________________
+  # save the pca plot                                                       ####
+ggsave(
+  here(
+    "output", "gwas", "figures", "PCA_gwas2_females_binary.pdf"
+  ),
+  width  = 10,
+  height = 6,
+  units  = "in"
+)
+```
+
+
+Save it to disk
+```{r}
+# For Regenie we have to change the phenotype to 0 and 1
+# Update V6 based on the condition
+fam_pca$V6 <- ifelse(fam_pca$V6 == 1, 0, 1)
+head(fam_pca)
+```
+
+
+```{r}
+write.table(
+  fam_pca |>
+    dplyr::select(V1, V2, V6) |>
+    dplyr::rename(FID = V1,
+                  IID = V2,
+                  Diapause = V6),
+  file      = here(
+    "output", "gwas", "phenotype_binary.txt"
+  ),
+  sep       = "\t",
+  row.names = FALSE,
+  col.names = TRUE,
+  quote     = FALSE
+)
+```
+
+
+
+### 17.2 Perform MDS analysis and create a covar.txt file
+
+```{bash}
+# Create .genome file
+plink \
+--keep-allele-order \
+--allow-extra-chr \
+--allow-no-sex \
+--bfile output/gwas/file71 \
+--extract output/gwas/indepSNP_chr.prune.in \
+--genome \
+--out output/gwas/file8 \
+--silent;
+grep 'samples\|variants' output/gwas/file8.log
+```
+
+MDS with 10 vectors
+```{bash}
+# Make mds with 10 vectors
+plink \
+--keep-allele-order \
+--allow-extra-chr \
+--allow-no-sex \
+--bfile output/gwas/file71 \
+--read-genome output/gwas/file8.genome \
+--cluster \
+--mds-plot 10 \
+--out output/gwas/file9_mds \
+--silent;
+grep 'samples\|variants' output/gwas/file9_mds.log
+```
+
+Create covar
+```{bash}
+# Change the format of the .mds file into a plink covariate file.
+awk '{print$1, $2, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13}' output/gwas/file9_mds.mds > output/gwas/covar_mds.txt;
+head output/gwas/covar_mds.txt
+```
+
+Count how many samples in each phenotype bin
+```{r}
+# Count the number of Phenotype values in each Phenotype_category
+fam_pca |>
+  group_by(V6) |>
+  summarise(count = n(), .groups = "drop")
+```
+
+```{r}
+# Load our data
+covar_mds <- read.table("output/gwas/covar_mds.txt", header=TRUE)
+
+# Map each unique block to a unique number
+block_mapping <- as.numeric(factor(covar_mds$FID))
+
+# Add this as a new column to our dataframe
+covar_mds$Block <- block_mapping
+
+# Write the updated data frame back to a text file
+write.table(covar_mds, file="output/gwas/covar_mds_updated.txt", sep="\t", row.names=FALSE, quote=FALSE)
+
+covar_mds
+```
+
+
+## 18. Run Regenie as binary trait
+
+```{bash}
+plink2 \
+--bfile output/gwas/file71 \
+--geno 0.1 \
+--maf 0.01 \
+--mind 0.1 \
+--mac 50 \
+--no-id-header \
+--out output/regenie/gwas/qc_pass \
+--write-samples \
+--write-snplist \
+--silent
+grep 'samples\|variants' output/regenie/gwas/qc_pass.log
+```
+
+
+Step 1 with Regenie
+```{bash}
+regenie \
+--step 1 \
+--bed output/gwas/file71 \
+--extract output/regenie/gwas/qc_pass.snplist \
+--keep output/regenie/gwas/qc_pass.id \
+--phenoFile output/gwas/phenotype_binary.txt \
+--covarFile output/gwas/covar_mds_updated.txt \
+--bt \
+--bsize 1000 \
+--lowmem \
+--out output/regenie/gwas/Output_binary_Step1
+```
+
+
+```{bash}
+plink2 \
+--bfile output/gwas/file71 \
+--export bgen-1.2 'bits=8' \
+--out output/regenie/gwas/file2_binary
+```
+
+Step 2
+```{bash}
+regenie \
+--step 2 \
+--bgen output/regenie/gwas/file2_binary.bgen \
+--sample output/regenie/gwas/file2_binary.sample \
+--phenoFile output/gwas/phenotype_binary.txt \
+--covarFile output/gwas/covar_mds_updated.txt \
+--bt \
+--extract output/regenie/gwas/qc_pass.snplist \
+--firth --approx --pThresh 0.01 \
+--pred output/regenie/gwas/Output_binary_Step1_pred.list \
+--bsize 200 \
+--out output/regenie/gwas/Output_binary_Step2
+
+```
+
+### 18.1. Manhattan plot
+Now import the data into R
+```{r}
+l <- fread(here("output", "regenie", "gwas", "Output_binary_Step2_Diapause.regenie"))
+l$P <-10^(-l$LOG10P) 
+head(l)
+```
+```{r}
+manhattan(
+  l,
+  snp = "ID",
+  bp = "GENPOS",
+  chr = "CHROM",
+  main = "Binary with covar for stratification + blocks",
+  col = c("#42A7E1", "#B6419B", "#ECB766"),
+  annotatePval = TRUE,
+  annotateTop = TRUE,
+  highlight = l$ID[order(l$P)[1:10]]
+)
+```
+```{r}
+# Start the PDF device
+pdf(here("output", "regenie", "gwas", "figures", "manhattan_plot_binary.pdf"), width = 8, height = 5)
+
+# Create the Manhattan plot
+manhattan(
+  l,
+  snp = "ID",
+  bp = "GENPOS",
+  chr = "CHROM",
+  suggestiveline = -log10(1e-05),
+  main = "Binary with covar for stratification + blocks",
+  col = c("#42A7E1", "#B6419B", "#ECB766"),
+  annotatePval = TRUE,
+  annotateTop = TRUE,
+  highlight = l$ID[order(l$P)[1:5]]
+)
+
+# Close the PDF device
+dev.off()
+```
+
+```{r}
+# Convert chromosome to factor to ensure they are plotted as discrete entities
+l$CHROM <- factor(l$CHROM)
+
+# Modify the GENPOS column to reflect megabases
+l$GENPOS_MB <- l$GENPOS / 1e6
+
+# Create the Manhattan plot with genomic position in megabases
+ggplot(l, aes(x = GENPOS_MB, y = -log10(P), colour = CHROM)) +
+  geom_point(alpha = 0.6, size = 1.2) +  # Adjust the point size and transparency as needed
+  scale_colour_manual(values = c("#42A7E1", "#B6419B", "#ECB766")) +
+  facet_wrap(~ CHROM, scales = "free_x") +
+  labs(title = "Binary With Covar for Stratification", 
+       x = "Genomic Position (Mb)", y = "-log10(P-value)") +
+  geom_hline(yintercept = -log10(5e-5), linetype = "dashed", color = "black") +  # Threshold line
+  my_theme() +
+  theme(legend.position = "none",  # Hide the legend if not needed
+        panel.spacing = unit(0.1, "lines"),  # Adjust spacing between panels
+        strip.text.x = element_text(size = 8)) +  # Adjust chromosome label size
+  scale_x_continuous(labels = label_number_auto()) +  # Use scales package to format x-axis labels
+  geom_vline(data = subset(l, CHROM == 1), aes(xintercept = 268108788/1e6), linetype = "dashed", color = "red") + # region with peak 
+  geom_vline(data = subset(l, CHROM == 1), aes(xintercept = 69418672/1e6), linetype = "dashed", color = "blue") + # region with peak
+  geom_vline(data = subset(l, CHROM == 1), aes(xintercept = 84256117/1e6), linetype = "dashed", color = "orange") + # region with peak
+  geom_vline(data = subset(l, CHROM == 1), aes(xintercept = 240248285/1e6), linetype = "dashed", color = "magenta") # peak from wild populations
+
+# save it
+ggsave(
+  here(
+    "output", "regenie", "gwas", "figures", "Manhattan_binary.pdf"
+  ),
+  width  = 10,
+  height = 6,
+  units  = "in"
+)
+```
+
+### 18.2 P-value distribution
+```{r}
+# source the plotting function
+source(
+  here(
+    "scripts", "analysis", "my_theme2.R"
+  )
+)
+
+ggplot(l, aes(x = P)) +
+  geom_histogram(binwidth = 0.05, color = "black", fill = "lightpink") + 
+  labs(x = "P-value", 
+       y = "Frequency", 
+       title = "Distribution of P-values") + my_theme() 
+
+# Save it
+ggsave(
+  here(
+    "output", "regenie", "gwas", "figures", "p_value_dist_binary.pdf"
+  ),
+  width  = 8,
+  height = 5,
+  units  = "in"
+)
+```
+
+We can re-do the same analysis but starting with the quality control steps and use only the samples we will use in our analysis. I will create a new Markdown for it.
+
+
+## 19. iqtree
+```{bash}
+wc -l output/iqtree/manuscript1_pops.txt
+```
+
+```{bash}
+plink2 \
+--allow-extra-chr \
+--bfile output/global/file7 \
+--keep-fam output/iqtree/manuscript1_pops.txt \
+--make-bed \
+--out output/iqtree/file1 \
+--silent;
+grep 'samples\|variants\|remaining' output/iqtree/file1.log
+```
+
+We will create a vcf with the intergenic SNPs to run iqtree
+
+
+```{bash}
+plink2 \
+--allow-extra-chr \
+--bfile output/iqtree/file1 \
+--extract output/iqtree/intergenic.txt \
+--recode vcf \
+--out output/iqtree/file2 \
+--silent;
+grep 'samples\|variants\|remaining' output/iqtree/file2.log
+```
+
+Convert it to phylip format with python script
+```{bash}
+python output/iqtree/vcf2phylip.py -i /Users/lucianocosme/Library/CloudStorage/Dropbox/GWAS/diapause/output/iqtree/file2.vcf 
+```
+
+Check iqtree help
+```{bash}
+iqtree --help
+```
+
+Run iquetree
+```{bash, eval=FALSE}
+iqtree -s /Users/lucianocosme/Library/CloudStorage/Dropbox/GWAS/diapause/output/iqtree/file2.min4.phy -m MFP -bb 1000 -bnni -st DNA -nt
+```
+
+Then use Figtree to edit the trees
+
+Iqtree on the cluster (I downloaded it from here http://www.iqtree.org/#download)
+```{bash, eval=FALSE}
+cd /ycga-gpfs/project/caccone/lvc26/iqtree
+```
+
+Export path
+```{bash, eval=FALSE}
+export PATH=$PATH:/ycga-gpfs/project/caccone/lvc26/iqtree
+```
+
+I transferred the file to the cluster and run the script below
+```{bash, eval=FALSE}
+#!/bin/sh        
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=10         
+#SBATCH --mem-per-cpu=5gb
+#SBATCH --time=100:00:00
+#SBATCH --partition=week
+#SBATCH --job-name=iqtree_albo
+#SBATCH -o iqtree.%A_%a.albo.o.txt
+#SBATCH -e iqtree.%A_%a.albo.ERROR.txt
+
+cd /ycga-gpfs/project/caccone/lvc26/iqtree
+
+export PATH=$PATH:/ycga-gpfs/project/caccone/lvc26/iqtree
+
+iqtree2 -s albopictus/file2.min4.phy -m MFP -bb 1000 -bnni -st DNA -nt
+```
+
+```{bash, eval=FALSE}
+module load pigz/2.6-GCCcore-10.2.0
+
+tar -cf - /ycga-gpfs/project/caccone/lvc26/aegypti/mir | pigz -p 4 > miR.tar.gz
+tar -cf - /ycga-gpfs/project/caccone/lvc26/aegypti/mRNA | pigz -p 4 > mRNA2.tar.gz
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
